@@ -1,5 +1,6 @@
 """Telegram auto-sales bot: catalog, orders, VietQR payment, auto delivery."""
 
+import asyncio
 import logging
 import re
 from html import escape
@@ -489,6 +490,8 @@ def build_application(config: Config) -> Application:
 def main() -> None:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
     config = load_config()
+    # Python 3.14+ no longer creates a loop implicitly, which run_polling expects.
+    asyncio.set_event_loop(asyncio.new_event_loop())
     build_application(config).run_polling(allowed_updates=Update.ALL_TYPES)
 
 
