@@ -270,6 +270,105 @@ class Database:
             self.cancel_order(order["id"])
         return expired
 
+    # ---------- admin website ----------
+    def update_product(self, product_id: int, name: str, price: int, description: str) -> bool:
+        cur = self.conn.execute(
+            "UPDATE products SET name = ?, price = ?, description = ? WHERE id = ?",
+            (name, price, description, product_id),
+        )
+        return cur.rowcount > 0
+
+    def list_stock(self, product_id: int, available: bool, limit: int = 500) -> list[sqlite3.Row]:
+        cond = "order_id IS NULL" if available else "order_id IS NOT NULL"
+        return self.conn.execute(
+            f"SELECT s.id, s.content, s.order_id, o.code FROM stock s"
+            f" LEFT JOIN orders o ON o.id = s.order_id"
+            f" WHERE s.product_id = ? AND s.{cond} ORDER BY s.id DESC LIMIT ?",
+            (product_id, limit),
+        ).fetchall()
+
+    def stock_contents(self, product_id: int) -> set[str]:
+        rows = self.conn.execute("SELECT content FROM stock WHERE product_id = ?", (product_id,))
+        return {r["content"] for r in rows}
+
+    def delete_stock_item(self, stock_id: int) -> int | None:
+        """Delete an undelivered stock item; returns its product id."""
+        row = self.conn.execute(
+            "SELECT product_id FROM stock WHERE id = ? AND order_id IS NULL", (stock_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        self.conn.execute("DELETE FROM stock WHERE id = ?", (stock_id,))
+        return row["product_id"]
+
+    def revenue_summary(self) -> sqlite3.Row:
+        return self.conn.execute(
+            "SELECT"
+            " COALESCE(SUM(amount) FILTER (WHERE date(paid_at, 'localtime') = date('now', 'localtime')), 0) AS today,"
+            " COUNT(*) FILTER (WHERE date(paid_at, 'localtime') = date('now', 'localtime')) AS today_orders,"
+            " COALESCE(SUM(amount) FILTER (WHERE date(paid_at, 'localtime') >= date('now', 'localtime', '-6 days')), 0) AS week,"
+            " COALESCE(SUM(amount) FILTER (WHERE strftime('%Y-%m', paid_at, 'localtime')"
+            "   = strftime('%Y-%m', 'now', 'localtime')), 0) AS month,"
+            " COALESCE(SUM(amount), 0) AS total,"
+            " COUNT(*) AS total_orders"
+            " FROM orders WHERE status = 'paid'"
+        ).fetchone()
+
+    def revenue_by_day(self, days: int) -> dict[str, tuple[int, int]]:
+        """{'YYYY-MM-DD': (revenue, orders)} for paid orders in the last ``days`` local days."""
+        rows = self.conn.execute(
+            "SELECT date(paid_at, 'localtime') AS day, SUM(amount) AS revenue, COUNT(*) AS orders"
+            " FROM orders WHERE status = 'paid'"
+            " AND date(paid_at, 'localtime') >= date('now', 'localtime', ?)"
+            " GROUP BY day",
+            (f"-{days - 1} days",),
+        ).fetchall()
+        return {r["day"]: (r["revenue"], r["orders"]) for r in rows}
+
+    def top_products(self, days: int, limit: int = 5) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT p.name, SUM(o.quantity) AS sold, SUM(o.amount) AS revenue"
+            " FROM orders o JOIN products p ON p.id = o.product_id"
+            " WHERE o.status = 'paid' AND date(o.paid_at, 'localtime') >= date('now', 'localtime', ?)"
+            " GROUP BY p.id ORDER BY revenue DESC LIMIT ?",
+            (f"-{days - 1} days", limit),
+        ).fetchall()
+
+    def search_orders(
+        self,
+        status: str | None = None,
+        query: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int | None = 50,
+        offset: int = 0,
+    ) -> tuple[list[sqlite3.Row], int]:
+        where, params = [], []
+        if status:
+            where.append("o.status = ?")
+            params.append(status)
+        if query:
+            where.append("(o.code LIKE ? OR o.username LIKE ? OR CAST(o.user_id AS TEXT) = ? OR p.name LIKE ?)")
+            like = f"%{query.strip().lstrip('@')}%"
+            params += [like, like, query.strip(), like]
+        if date_from:
+            where.append("date(o.created_at, 'localtime') >= ?")
+            params.append(date_from)
+        if date_to:
+            where.append("date(o.created_at, 'localtime') <= ?")
+            params.append(date_to)
+        base = " FROM orders o JOIN products p ON p.id = o.product_id"
+        if where:
+            base += " WHERE " + " AND ".join(where)
+        total = self.conn.execute("SELECT COUNT(*)" + base, params).fetchone()[0]
+        sql = "SELECT o.*, p.name AS product_name" + base + " ORDER BY o.id DESC"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)} OFFSET {int(offset)}"
+        return self.conn.execute(sql, params).fetchall(), total
+
+    def count_users(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM users WHERE blocked = 0").fetchone()[0]
+
     def stats(self) -> sqlite3.Row:
         return self.conn.execute(
             "SELECT"
