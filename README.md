@@ -95,6 +95,15 @@ Bot ghi nhớ mọi người đã nhắn tin với nó, để gửi thông báo:
 Truy cập từ xa: cài [Tailscale](https://tailscale.com) trên máy chạy bot và trên điện thoại, rồi mở
 `http://<tên-máy>:8080/admin`.
 
+## Sao lưu & khôi phục
+
+- Bot tự tạo bản sao lưu **mỗi giờ** vào `BACKUP_DIR` (nên đặt trong iCloud Drive) và **gửi qua Telegram cho admin
+  mỗi ngày** lúc `BACKUP_TELEGRAM_HOUR` giờ. Mỗi bản là 1 file zip gồm `shop.db`, `.env` và thư mục `uploads/`.
+- Sao lưu ngay: lệnh `/backup` trong bot, hoặc nút **💾 Sao lưu** trên trang quản trị.
+- Khôi phục trên máy Mac mới: cài Python, tải code về `~/salesbot`, rồi chạy
+  `bash ~/salesbot/setup_mac.sh ~/Downloads/salesbot-backup-....zip` — script cài thư viện, khôi phục dữ liệu
+  và cho bot chạy ngầm 24/24.
+
 ## Tự động xác nhận thanh toán (tuỳ chọn)
 
 Mặc định admin nhận thông báo mỗi đơn mới và bấm **✅ Đã nhận tiền** để giao hàng.

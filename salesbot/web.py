@@ -185,6 +185,7 @@ def page(request: web.Request, title: str, body: str, active: str = "") -> web.R
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Quản trị shop</title>
 <style>{CSS}</style></head><body>
 <header><div class="bar"><span class="brand">🛍 Quản trị shop</span><nav>{nav}</nav>
+<a class="btn ghost small" href="/admin/backup.zip" title="Tải bản sao lưu dữ liệu">💾 Sao lưu</a>
 <form class="inline" method="post" action="/admin/logout"><button class="ghost small">Đăng xuất</button></form></div></header>
 <main>{flash}{body}</main></body></html>"""
     return web.Response(text=html, content_type="text/html")
@@ -882,6 +883,11 @@ async def set_auto_restock(request: web.Request) -> web.Response:
 
 # ---------------------------------------------------------------- wiring
 
+async def download_backup(request: web.Request) -> web.Response:
+    path = bot_module().create_backup(tg(request))
+    return web.FileResponse(path, headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
+
+
 async def root(request: web.Request) -> web.Response:
     raise web.HTTPFound("/admin")
 
@@ -916,3 +922,4 @@ def setup_admin(web_app: web.Application, tg_app) -> None:
     r.add_post("/admin/posts/{id:\\d+}/cancel", cancel_post)
     r.add_get("/admin/uploads/{name}", upload_file)
     r.add_post("/admin/settings/auto-restock", set_auto_restock)
+    r.add_get("/admin/backup.zip", download_backup)

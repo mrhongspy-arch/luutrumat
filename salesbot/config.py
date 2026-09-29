@@ -25,6 +25,9 @@ class Config:
     auto_restock_notify: bool
     admin_password: str
     web_port: int
+    backup_dir: str
+    backup_keep: int
+    backup_telegram_hour: int
     webhook_enabled: bool
     webhook_secret: str
 
@@ -50,6 +53,9 @@ def load_config() -> Config:
         auto_restock_notify=_bool(os.getenv("AUTO_RESTOCK_NOTIFY", "true")),
         admin_password=os.getenv("ADMIN_PASSWORD", ""),
         web_port=int(os.getenv("WEB_PORT") or os.getenv("WEBHOOK_PORT") or "8080"),
+        backup_dir=os.getenv("BACKUP_DIR", "backups"),
+        backup_keep=int(os.getenv("BACKUP_KEEP", "72")),
+        backup_telegram_hour=int(os.getenv("BACKUP_TELEGRAM_HOUR", "3")),
         webhook_enabled=_bool(os.getenv("WEBHOOK_ENABLED")),
         webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
     )

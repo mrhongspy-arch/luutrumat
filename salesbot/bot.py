@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import socket
+from datetime import datetime, time as dtime
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
@@ -22,6 +23,7 @@ from telegram.ext import (
     filters,
 )
 
+from .backup import make_backup, prune
 from .config import Config, load_config
 from .db import Database
 
@@ -464,6 +466,49 @@ async def post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await run_due_posts(context.application)
 
 
+# ---------------------------------------------------------------- backups
+
+def backup_dir(app: Application) -> Path:
+    config: Config = app.bot_data["config"]
+    path = Path(config.backup_dir).expanduser()
+    if not path.is_absolute():
+        path = Path(config.db_path).resolve().parent / path
+    return path
+
+
+def create_backup(app: Application) -> Path:
+    config: Config = app.bot_data["config"]
+    path = make_backup(app.bot_data["db"], config.db_path, backup_dir(app))
+    prune(backup_dir(app), config.backup_keep)
+    return path
+
+
+async def send_backup(app: Application, chat_ids) -> None:
+    path = create_backup(app)
+    for chat_id in chat_ids:
+        with path.open("rb") as f:
+            await app.bot.send_document(
+                chat_id, f, filename=path.name,
+                caption=f"💾 Bản sao lưu {datetime.now():%H:%M %d/%m/%Y}. Giữ kín: có token bot và dữ liệu khách.",
+            )
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        create_backup(context.application)
+    except Exception:
+        log.exception("Backup failed")
+        await report_to_admins(context.application, "⚠️ Sao lưu tự động bị lỗi, xem bot.log.")
+
+
+async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await send_backup(context.application, context.application.bot_data["config"].admin_ids)
+    except Exception:
+        log.exception("Daily backup failed")
+        await report_to_admins(context.application, "⚠️ Không gửi được bản sao lưu hằng ngày, xem bot.log.")
+
+
 # ---------------------------------------------------------------- admin
 
 ADMIN_HELP = """<b>Lệnh quản trị</b>
@@ -479,7 +524,8 @@ ADMIN_HELP = """<b>Lệnh quản trị</b>
 /confirm MÃ_ĐƠN — xác nhận đã thanh toán và giao hàng
 /cancel MÃ_ĐƠN — huỷ đơn
 /stats — thống kê doanh thu
-/web — địa chỉ trang quản trị"""
+/web — địa chỉ trang quản trị
+/backup — gửi ngay bản sao lưu dữ liệu"""
 
 
 def admin_only(handler):
@@ -731,6 +777,12 @@ def lan_address() -> str | None:
 
 
 @admin_only
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("💾 Đang tạo bản sao lưu…")
+    await send_backup(context.application, [update.effective_chat.id])
+
+
+@admin_only
 async def web_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config = cfg(context)
     if not context.application.bot_data.get("admin_enabled"):
@@ -799,6 +851,7 @@ def build_application(config: Config) -> Application:
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("setemoji", set_emoji))
     app.add_handler(CommandHandler("web", web_link))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("confirm", confirm))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stats", stats))
@@ -809,6 +862,10 @@ def build_application(config: Config) -> Application:
 
     app.job_queue.run_repeating(expire_job, interval=60, first=10)
     app.job_queue.run_repeating(post_job, interval=30, first=15)
+    app.job_queue.run_repeating(backup_job, interval=3600, first=60)
+    if 0 <= config.backup_telegram_hour <= 23:
+        local_tz = datetime.now().astimezone().tzinfo
+        app.job_queue.run_daily(daily_backup_job, dtime(config.backup_telegram_hour, 0, tzinfo=local_tz))
     return app
 
 

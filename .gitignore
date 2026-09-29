@@ -2,3 +2,7 @@
 *.db
 __pycache__/
 .venv/
+backups/
+uploads/
+salesbot-backup-*.zip
+bot.log
