@@ -3,7 +3,9 @@
 import asyncio
 import logging
 import re
+import socket
 from html import escape
+from pathlib import Path
 from urllib.parse import quote
 
 from aiohttp import web
@@ -389,6 +391,79 @@ async def announce_product(app: Application, product_id: int) -> None:
     await report_to_admins(app, f"📣 Đã báo có hàng {product['name']}: gửi {delivered} người, lỗi {failed}.")
 
 
+def auto_restock_enabled(app: Application) -> bool:
+    default = "1" if app.bot_data["config"].auto_restock_notify else "0"
+    return app.bot_data["db"].get_setting("auto_restock", default) == "1"
+
+
+def after_restock(app: Application, product_id: int, was_sold_out: bool) -> bool:
+    """Announce a product that just came back in stock; True if an announcement started."""
+    if not (was_sold_out and auto_restock_enabled(app)):
+        return False
+    if app.bot_data["db"].sellable_quantity(product_id) == 0:
+        return False
+    app.create_task(announce_product(app, product_id))
+    return True
+
+
+def uploads_dir(app: Application) -> Path:
+    path = Path(app.bot_data["config"].db_path).resolve().parent / "uploads"
+    path.mkdir(exist_ok=True)
+    return path
+
+
+async def send_post(app: Application, post, chat_ids: list[int] | None = None) -> tuple[int, int]:
+    """Send a promotional post (text, optional image and Mua ngay button).
+
+    Goes to every user, or only to ``chat_ids`` (used for test sends)."""
+    markup = None
+    if post["product_id"]:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🛒 Mua ngay", callback_data=f"view:{post['product_id']}")]]
+        )
+    photo = uploads_dir(app) / post["image"] if post["image"] else None
+    file_id = None  # upload the image once, then reuse Telegram's copy
+
+    async def send(chat_id: int) -> None:
+        nonlocal file_id
+        if photo is None:
+            await send_html(app.bot, chat_id, post["text"], reply_markup=markup)
+            return
+        message = await app.bot.send_photo(
+            chat_id, file_id or photo, caption=post["text"], parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+        file_id = file_id or message.photo[-1].file_id
+
+    if chat_ids is None:
+        return await broadcast(app, send)
+    delivered = failed = 0
+    for chat_id in chat_ids:
+        try:
+            await send(chat_id)
+            delivered += 1
+        except TelegramError as e:
+            log.warning("Test post to %s failed: %s", chat_id, e)
+            failed += 1
+            raise
+    return delivered, failed
+
+
+async def run_due_posts(app: Application) -> None:
+    database: Database = app.bot_data["db"]
+    for post in database.claim_due_posts():
+        try:
+            delivered, failed = await send_post(app, post)
+        except Exception:
+            log.exception("Post %s failed", post["id"])
+            delivered, failed = 0, len(database.active_user_ids())
+        database.finish_post(post["id"], delivered, failed)
+        await report_to_admins(app, f"📣 Đã gửi tin khuyến mãi #{post['id']}: {delivered} người nhận, lỗi {failed}.")
+
+
+async def post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_due_posts(context.application)
+
+
 # ---------------------------------------------------------------- admin
 
 ADMIN_HELP = """<b>Lệnh quản trị</b>
@@ -403,7 +478,8 @@ ADMIN_HELP = """<b>Lệnh quản trị</b>
 /setemoji badge|stock|price EMOJI — đổi biểu tượng trong tin "có hàng lại" (hỗ trợ emoji động)
 /confirm MÃ_ĐƠN — xác nhận đã thanh toán và giao hàng
 /cancel MÃ_ĐƠN — huỷ đơn
-/stats — thống kê doanh thu"""
+/stats — thống kê doanh thu
+/web — địa chỉ trang quản trị"""
 
 
 def admin_only(handler):
@@ -450,9 +526,8 @@ async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     was_sold_out = db(context).sellable_quantity(product_id) == 0
     count = db(context).add_stock(product_id, items)
     await update.message.reply_text(f"Đã nạp {count} hàng cho sản phẩm #{product_id}.")
-    if was_sold_out and cfg(context).auto_restock_notify:
+    if after_restock(context.application, product_id, was_sold_out):
         await update.message.reply_text("📣 Sản phẩm vừa có hàng lại, đang gửi thông báo cho khách…")
-        context.application.create_task(announce_product(context.application, product_id))
 
 
 @admin_only
@@ -605,7 +680,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------------------------------------------------------------- payment webhook
 
-def build_webhook_app(app: Application) -> web.Application:
+def add_payment_route(web_app: web.Application, app: Application) -> None:
     """HTTP endpoint for bank-transfer notifications (SePay, Casso, ...).
 
     Finds the order code in the transfer description and delivers the order
@@ -643,21 +718,54 @@ def build_webhook_app(app: Application) -> web.Application:
             await deliver(app, order["id"])
         return web.json_response({"success": True})
 
-    web_app = web.Application()
     web_app.router.add_post("/payment", handle)
-    return web_app
+
+
+def lan_address() -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))  # no packet is sent; just picks the outgoing interface
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+@admin_only
+async def web_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config = cfg(context)
+    if not context.application.bot_data.get("admin_enabled"):
+        await update.message.reply_text(
+            "Trang quản trị chưa bật. Thêm ADMIN_PASSWORD=mật_khẩu_của_bạn (ít nhất 8 ký tự) vào .env rồi khởi động lại bot."
+        )
+        return
+    links = [f"http://localhost:{config.web_port}/admin (trên chính máy chạy bot)"]
+    ip = lan_address()
+    if ip:
+        links.append(f"http://{ip}:{config.web_port}/admin (máy khác cùng Wi-Fi)")
+    links.append(f"http://<tên-máy-trong-Tailscale>:{config.web_port}/admin (khi ở ngoài, qua Tailscale)")
+    await update.message.reply_text("🖥 Trang quản trị:\n" + "\n".join(links), disable_web_page_preview=True)
 
 
 # ---------------------------------------------------------------- wiring
 
 async def post_init(app: Application) -> None:
     config: Config = app.bot_data["config"]
+    web_app = web.Application(client_max_size=20 * 1024 * 1024)
     if config.webhook_enabled:
-        runner = web.AppRunner(build_webhook_app(app))
+        add_payment_route(web_app, app)
+    if len(config.admin_password) >= 8:
+        from .web import setup_admin
+
+        setup_admin(web_app, app)
+        app.bot_data["admin_enabled"] = True
+    elif config.admin_password:
+        log.warning("ADMIN_PASSWORD phải có ít nhất 8 ký tự; trang quản trị chưa được bật.")
+    if config.webhook_enabled or app.bot_data.get("admin_enabled"):
+        runner = web.AppRunner(web_app)
         await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", config.webhook_port).start()
+        await web.TCPSite(runner, "0.0.0.0", config.web_port).start()
         app.bot_data["web_runner"] = runner
-        log.info("Payment webhook listening on :%s/payment", config.webhook_port)
+        log.info("Web server listening on port %s", config.web_port)
 
 
 async def post_shutdown(app: Application) -> None:
@@ -690,6 +798,7 @@ def build_application(config: Config) -> Application:
     app.add_handler(CommandHandler("notify", notify))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("setemoji", set_emoji))
+    app.add_handler(CommandHandler("web", web_link))
     app.add_handler(CommandHandler("confirm", confirm))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stats", stats))
@@ -699,6 +808,7 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(on_callback))
 
     app.job_queue.run_repeating(expire_job, interval=60, first=10)
+    app.job_queue.run_repeating(post_job, interval=30, first=15)
     return app
 
 

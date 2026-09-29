@@ -23,8 +23,9 @@ class Config:
     db_path: str
     channel_id: str
     auto_restock_notify: bool
+    admin_password: str
+    web_port: int
     webhook_enabled: bool
-    webhook_port: int
     webhook_secret: str
 
 
@@ -47,7 +48,8 @@ def load_config() -> Config:
         db_path=os.getenv("DB_PATH", "shop.db"),
         channel_id=os.getenv("CHANNEL_ID", "").strip(),
         auto_restock_notify=_bool(os.getenv("AUTO_RESTOCK_NOTIFY", "true")),
+        admin_password=os.getenv("ADMIN_PASSWORD", ""),
+        web_port=int(os.getenv("WEB_PORT") or os.getenv("WEBHOOK_PORT") or "8080"),
         webhook_enabled=_bool(os.getenv("WEBHOOK_ENABLED")),
-        webhook_port=int(os.getenv("WEBHOOK_PORT", "8080")),
         webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
     )

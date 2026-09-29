@@ -80,6 +80,21 @@ Bot ghi nhớ mọi người đã nhắn tin với nó, để gửi thông báo:
 - **Kênh Telegram (tuỳ chọn):** đặt `CHANNEL_ID=@kenhcuashop` và thêm bot làm admin kênh;
   thông báo có hàng sẽ được đăng lên kênh, nút Mua ngay mở bot đúng sản phẩm.
 
+## Trang quản trị web
+
+Đặt `ADMIN_PASSWORD=...` (ít nhất 8 ký tự) trong `.env`, khởi động lại bot rồi mở
+`http://localhost:8080/admin` (gõ `/web` trong bot để xem các địa chỉ). Gồm:
+
+- **Tổng quan:** doanh thu hôm nay / 7 ngày / tháng / tổng, biểu đồ theo ngày, sản phẩm bán chạy, sắp hết hàng
+- **Sản phẩm & kho:** thêm, sửa, ẩn/hiện; nhập kho từ Excel (.xlsx nhiều cột được ghép `a | b | c`), CSV, TXT
+  hoặc dán trực tiếp; bỏ qua hàng trùng; xoá hàng chưa bán
+- **Đơn hàng:** lọc theo trạng thái/ngày/khách, xác nhận đã nhận tiền, huỷ, gửi lại hàng, **xuất Excel**
+- **Thông báo:** soạn tin khuyến mãi có ảnh + nút Mua ngay, gửi thử cho mình, gửi ngay hoặc **hẹn giờ**;
+  bật/tắt thông báo "có hàng lại" tự động
+
+Truy cập từ xa: cài [Tailscale](https://tailscale.com) trên máy chạy bot và trên điện thoại, rồi mở
+`http://<tên-máy>:8080/admin`.
+
 ## Tự động xác nhận thanh toán (tuỳ chọn)
 
 Mặc định admin nhận thông báo mỗi đơn mới và bấm **✅ Đã nhận tiền** để giao hàng.

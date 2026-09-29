@@ -42,6 +42,17 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,             -- Telegram HTML
+    image TEXT,                     -- file name inside the uploads folder
+    product_id INTEGER REFERENCES products(id),
+    send_at TEXT NOT NULL,          -- UTC ISO time
+    status TEXT NOT NULL DEFAULT 'scheduled',  -- scheduled | sending | sent | cancelled
+    delivered INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_stock_available ON stock(product_id, order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 """
@@ -365,6 +376,52 @@ class Database:
         if limit is not None:
             sql += f" LIMIT {int(limit)} OFFSET {int(offset)}"
         return self.conn.execute(sql, params).fetchall(), total
+
+    def delivered_count(self, product_id: int) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM stock WHERE product_id = ? AND order_id IS NOT NULL", (product_id,)
+        ).fetchone()[0]
+
+    # ---------- promotional posts ----------
+    def create_post(self, text: str, image: str | None, product_id: int | None, send_at: datetime) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO posts (text, image, product_id, send_at, created_at) VALUES (?, ?, ?, ?, ?)",
+            (text, image, product_id, send_at.astimezone(timezone.utc).isoformat(timespec="seconds"), _now()),
+        )
+        return cur.lastrowid
+
+    def list_posts(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT po.*, p.name AS product_name FROM posts po LEFT JOIN products p ON p.id = po.product_id"
+            " ORDER BY CASE po.status WHEN 'scheduled' THEN 0 ELSE 1 END, po.send_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def claim_due_posts(self) -> list[sqlite3.Row]:
+        """Mark due scheduled posts as 'sending' and return them (each post is claimed once)."""
+        due = self.conn.execute(
+            "SELECT * FROM posts WHERE status = 'scheduled' AND send_at <= ? ORDER BY send_at", (_now(),)
+        ).fetchall()
+        claimed = []
+        for post in due:
+            cur = self.conn.execute(
+                "UPDATE posts SET status = 'sending' WHERE id = ? AND status = 'scheduled'", (post["id"],)
+            )
+            if cur.rowcount:
+                claimed.append(post)
+        return claimed
+
+    def finish_post(self, post_id: int, delivered: int, failed: int) -> None:
+        self.conn.execute(
+            "UPDATE posts SET status = 'sent', delivered = ?, failed = ? WHERE id = ?",
+            (delivered, failed, post_id),
+        )
+
+    def cancel_post(self, post_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE posts SET status = 'cancelled' WHERE id = ? AND status = 'scheduled'", (post_id,)
+        )
+        return cur.rowcount > 0
 
     def count_users(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM users WHERE blocked = 0").fetchone()[0]
