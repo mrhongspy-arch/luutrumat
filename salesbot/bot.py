@@ -9,12 +9,14 @@ from urllib.parse import quote
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -56,7 +58,21 @@ def qr_url(config: Config, amount: int, note: str) -> str:
 
 # ---------------------------------------------------------------- customer
 
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remember everyone who talks to the bot privately so announcements can reach them."""
+    user, chat = update.effective_user, update.effective_chat
+    if user and chat and chat.type == "private":
+        db(context).upsert_user(user.id, user.username, user.first_name)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Deep link from a channel post: t.me/<bot>?start=p<product_id>
+    if context.args and re.fullmatch(r"p\d+", context.args[0]):
+        await update.message.reply_text("👋 Chào bạn! Đây là sản phẩm bạn quan tâm:", reply_markup=MAIN_MENU)
+        view = product_view(context, int(context.args[0][1:]))
+        if view:
+            await update.message.reply_text(view[0], parse_mode=ParseMode.HTML, reply_markup=view[1])
+            return
     name = escape(update.effective_user.first_name or "bạn")
     await update.message.reply_text(
         f"👋 Xin chào <b>{name}</b>!\nChào mừng đến với cửa hàng. Chọn một mục bên dưới để bắt đầu.",
@@ -86,12 +102,11 @@ async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
-async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
-    query = update.callback_query
+def product_view(context: ContextTypes.DEFAULT_TYPE, product_id: int):
+    """Text and buttons for one product, or None if it is gone or hidden."""
     product = db(context).get_product(product_id)
     if product is None or not product["active"]:
-        await query.edit_message_text("Sản phẩm không còn tồn tại.")
-        return
+        return None
     available = db(context).sellable_quantity(product_id)
     text = (
         f"<b>{escape(product['name'])}</b>\n\n{escape(product['description'])}\n\n"
@@ -107,7 +122,15 @@ async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, produ
     else:
         text += "\n\n⚠️ Sản phẩm tạm hết hàng."
     rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="list")])
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    view = product_view(context, product_id)
+    if view is None:
+        await update.callback_query.edit_message_text("Sản phẩm không còn tồn tại.")
+        return
+    await update.callback_query.edit_message_text(view[0], parse_mode=ParseMode.HTML, reply_markup=view[1])
 
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int, qty: int) -> None:
@@ -177,6 +200,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif action == "prod":
         await query.answer()
         await show_product(update, context, int(args[0]))
+    elif action == "view":
+        # "Mua ngay" under an announcement: open the product in a new message,
+        # leaving the announcement itself untouched.
+        await query.answer()
+        view = product_view(context, int(args[0]))
+        if view is None:
+            await query.message.reply_text("Sản phẩm không còn tồn tại.")
+        else:
+            await query.message.reply_text(view[0], parse_mode=ParseMode.HTML, reply_markup=view[1])
     elif action == "buy":
         await query.answer()
         await buy(update, context, int(args[0]), int(args[1]))
@@ -261,6 +293,72 @@ async def expire_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("Could not notify user %s about expired order", order["user_id"])
 
 
+# ---------------------------------------------------------------- announcements
+
+async def broadcast(app: Application, send) -> tuple[int, int]:
+    """Call ``send(chat_id)`` for every active user, respecting Telegram rate limits.
+
+    Returns (delivered, failed). Users who blocked the bot are skipped next time.
+    """
+    database: Database = app.bot_data["db"]
+    delivered = failed = 0
+    for user_id in database.active_user_ids():
+        for _ in range(2):
+            try:
+                await send(user_id)
+                delivered += 1
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                continue
+            except Forbidden:
+                database.set_user_blocked(user_id)
+                failed += 1
+            except TelegramError as e:
+                log.warning("Broadcast to %s failed: %s", user_id, e)
+                failed += 1
+            break
+        await asyncio.sleep(0.05)  # stay under ~30 messages/second
+    return delivered, failed
+
+
+async def report_to_admins(app: Application, text: str) -> None:
+    for admin_id in app.bot_data["config"].admin_ids:
+        await app.bot.send_message(admin_id, text)
+
+
+def restock_text(product, available: int) -> str:
+    return (
+        f"🔥 <b>TIN NÓNG</b> — <b>{escape(product['name'])}</b> đã có hàng lại!\n\n"
+        f"📦 Số lượng còn: <b>{available}</b>\n"
+        f"💰 Giá: <b>{money(product['price'])}</b>"
+    )
+
+
+async def announce_product(app: Application, product_id: int) -> None:
+    """Post a restock notice for a product to all users and the shop channel."""
+    database: Database = app.bot_data["db"]
+    config: Config = app.bot_data["config"]
+    product = database.get_product(product_id)
+    available = database.sellable_quantity(product_id)
+    if product is None or not product["active"] or available == 0:
+        return
+    text = restock_text(product, available)
+    if config.channel_id:
+        link = f"https://t.me/{app.bot.username}?start=p{product_id}"
+        try:
+            await app.bot.send_message(
+                config.channel_id, text, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Mua ngay", url=link)]]),
+            )
+        except TelegramError as e:
+            await report_to_admins(app, f"⚠️ Không đăng được lên kênh {config.channel_id}: {e}")
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Mua ngay", callback_data=f"view:{product_id}")]])
+    delivered, failed = await broadcast(
+        app, lambda chat_id: app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    )
+    await report_to_admins(app, f"📣 Đã báo có hàng {product['name']}: gửi {delivered} người, lỗi {failed}.")
+
+
 # ---------------------------------------------------------------- admin
 
 ADMIN_HELP = """<b>Lệnh quản trị</b>
@@ -270,6 +368,8 @@ ADMIN_HELP = """<b>Lệnh quản trị</b>
 /hide ID, /show ID — ẩn/hiện sản phẩm
 /allproducts — xem tất cả sản phẩm và tồn kho
 /orders [pending|paid|cancelled] — xem đơn
+/notify ID — gửi thông báo "có hàng lại" của sản phẩm cho mọi khách
+/broadcast [ID] — trả lời (reply) một tin nhắn/ảnh bằng lệnh này để gửi nó cho mọi khách; thêm ID để gắn nút 🛒 Mua ngay
 /confirm MÃ_ĐƠN — xác nhận đã thanh toán và giao hàng
 /cancel MÃ_ĐƠN — huỷ đơn
 /stats — thống kê doanh thu"""
@@ -316,8 +416,51 @@ async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not items:
         await update.message.reply_text("Hãy ghi mỗi hàng trên một dòng, sau dòng /addstock ID.")
         return
+    was_sold_out = db(context).sellable_quantity(product_id) == 0
     count = db(context).add_stock(product_id, items)
     await update.message.reply_text(f"Đã nạp {count} hàng cho sản phẩm #{product_id}.")
+    if was_sold_out and cfg(context).auto_restock_notify:
+        await update.message.reply_text("📣 Sản phẩm vừa có hàng lại, đang gửi thông báo cho khách…")
+        context.application.create_task(announce_product(context.application, product_id))
+
+
+@admin_only
+async def notify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    product_id = int(context.args[0])
+    if db(context).sellable_quantity(product_id) == 0:
+        await update.message.reply_text("Sản phẩm không tồn tại, đang ẩn hoặc đã hết hàng.")
+        return
+    await update.message.reply_text("📣 Đang gửi thông báo…")
+    context.application.create_task(announce_product(context.application, product_id))
+
+
+@admin_only
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    source = update.message.reply_to_message
+    if source is None:
+        await update.message.reply_text(
+            "Cách dùng: soạn tin (chữ hoặc ảnh kèm chú thích) gửi cho bot, "
+            "sau đó bấm Trả lời (Reply) vào tin đó và gõ /broadcast\n"
+            "Muốn kèm nút 🛒 Mua ngay cho sản phẩm #3 thì gõ /broadcast 3"
+        )
+        return
+    markup = None
+    if context.args:
+        product_id = int(context.args[0])
+        if db(context).get_product(product_id) is None:
+            await update.message.reply_text("Không tìm thấy sản phẩm.")
+            return
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Mua ngay", callback_data=f"view:{product_id}")]])
+    app = context.application
+
+    async def run() -> None:
+        delivered, failed = await broadcast(
+            app, lambda chat_id: app.bot.copy_message(chat_id, source.chat_id, source.message_id, reply_markup=markup)
+        )
+        await report_to_admins(app, f"📣 Đã gửi thông báo: {delivered} người nhận, lỗi {failed}.")
+
+    await update.message.reply_text(f"📣 Đang gửi cho {len(db(context).active_user_ids())} khách…")
+    app.create_task(run())
 
 
 @admin_only
@@ -388,7 +531,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = db(context).stats()
     await update.message.reply_text(
         f"📊 Doanh thu: {money(s['revenue'])}\nĐơn đã giao: {s['paid_orders']}\n"
-        f"Đơn chờ thanh toán: {s['pending_orders']}\nKhách hàng: {s['customers']}"
+        f"Đơn chờ thanh toán: {s['pending_orders']}\nKhách đã mua: {s['customers']}\n"
+        f"Người dùng bot: {s['users']}"
     )
 
 
@@ -466,6 +610,7 @@ def build_application(config: Config) -> Application:
     app.bot_data["config"] = config
     app.bot_data["db"] = Database(config.db_path)
 
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_help))
     app.add_handler(CommandHandler("addproduct", add_product))
@@ -475,6 +620,8 @@ def build_application(config: Config) -> Application:
     app.add_handler(CommandHandler("show", show_product_cmd))
     app.add_handler(CommandHandler("allproducts", all_products))
     app.add_handler(CommandHandler("orders", list_orders))
+    app.add_handler(CommandHandler("notify", notify))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("confirm", confirm))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stats", stats))

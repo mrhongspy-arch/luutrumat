@@ -21,6 +21,8 @@ class Config:
     order_timeout_minutes: int
     support_contact: str
     db_path: str
+    channel_id: str
+    auto_restock_notify: bool
     webhook_enabled: bool
     webhook_port: int
     webhook_secret: str
@@ -43,6 +45,8 @@ def load_config() -> Config:
         order_timeout_minutes=int(os.getenv("ORDER_TIMEOUT_MINUTES", "30")),
         support_contact=os.getenv("SUPPORT_CONTACT", ""),
         db_path=os.getenv("DB_PATH", "shop.db"),
+        channel_id=os.getenv("CHANNEL_ID", "").strip(),
+        auto_restock_notify=_bool(os.getenv("AUTO_RESTOCK_NOTIFY", "true")),
         webhook_enabled=_bool(os.getenv("WEBHOOK_ENABLED")),
         webhook_port=int(os.getenv("WEBHOOK_PORT", "8080")),
         webhook_secret=os.getenv("WEBHOOK_SECRET", ""),

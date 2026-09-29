@@ -66,6 +66,18 @@ Gõ `/admin` để xem toàn bộ lệnh quản trị.
 Khách gõ `/start` → **🛍 Sản phẩm** → chọn sản phẩm → **Mua 1** → bot gửi mã QR.
 Khi thanh toán được xác nhận, bot gửi ngay nội dung hàng cho khách.
 
+## Thông báo cho khách
+
+Bot ghi nhớ mọi người đã nhắn tin với nó, để gửi thông báo:
+
+- **Có hàng lại (tự động):** khi `/addstock` cho sản phẩm đang hết hàng, bot gửi
+  "🔥 TIN NÓNG — … đã có hàng lại!" kèm số lượng, giá và nút **🛒 Mua ngay** cho mọi khách.
+  Tắt bằng `AUTO_RESTOCK_NOTIFY=false`. Gửi lại bất cứ lúc nào bằng `/notify ID`.
+- **Tin khuyến mãi:** gửi cho bot một tin (chữ, hoặc ảnh kèm chú thích), rồi **Trả lời** tin đó
+  bằng `/broadcast` — bot gửi y nguyên cho mọi khách. `/broadcast 3` để kèm nút Mua ngay sản phẩm #3.
+- **Kênh Telegram (tuỳ chọn):** đặt `CHANNEL_ID=@kenhcuashop` và thêm bot làm admin kênh;
+  thông báo có hàng sẽ được đăng lên kênh, nút Mua ngay mở bot đúng sản phẩm.
+
 ## Tự động xác nhận thanh toán (tuỳ chọn)
 
 Mặc định admin nhận thông báo mỗi đơn mới và bấm **✅ Đã nhận tiền** để giao hàng.

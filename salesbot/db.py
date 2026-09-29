@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT NOT NULL,
     paid_at TEXT
 );
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    joined_at TEXT NOT NULL,
+    blocked INTEGER NOT NULL DEFAULT 0  -- 1 when the user blocked the bot
+);
 CREATE INDEX IF NOT EXISTS idx_stock_available ON stock(product_id, order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 """
@@ -46,6 +53,27 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        # Customers who ordered before the users table existed still get announcements.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO users (id, username, joined_at)"
+            " SELECT user_id, MAX(username), MIN(created_at) FROM orders GROUP BY user_id"
+        )
+
+    # ---------- users ----------
+    def upsert_user(self, user_id: int, username: str | None, first_name: str | None) -> None:
+        self.conn.execute(
+            "INSERT INTO users (id, username, first_name, joined_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET username = excluded.username,"
+            " first_name = excluded.first_name, blocked = 0",
+            (user_id, username, first_name, _now()),
+        )
+
+    def active_user_ids(self) -> list[int]:
+        rows = self.conn.execute("SELECT id FROM users WHERE blocked = 0 ORDER BY id").fetchall()
+        return [r["id"] for r in rows]
+
+    def set_user_blocked(self, user_id: int) -> None:
+        self.conn.execute("UPDATE users SET blocked = 1 WHERE id = ?", (user_id,))
 
     # ---------- products ----------
     def add_product(self, name: str, price: int, description: str = "") -> int:
@@ -229,6 +257,7 @@ class Database:
             " COUNT(*) FILTER (WHERE status = 'paid') AS paid_orders,"
             " COALESCE(SUM(amount) FILTER (WHERE status = 'paid'), 0) AS revenue,"
             " COUNT(*) FILTER (WHERE status = 'pending') AS pending_orders,"
-            " COUNT(DISTINCT user_id) AS customers"
+            " COUNT(DISTINCT user_id) AS customers,"
+            " (SELECT COUNT(*) FROM users WHERE blocked = 0) AS users"
             " FROM orders"
         ).fetchone()
