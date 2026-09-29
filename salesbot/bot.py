@@ -489,6 +489,9 @@ def build_application(config: Config) -> Application:
 
 def main() -> None:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+    # httpx logs every request URL, which contains the bot token; the scheduler logs every minute.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
     config = load_config()
     # Python 3.14+ no longer creates a loop implicitly, which run_polling expects.
     asyncio.set_event_loop(asyncio.new_event_loop())
