@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS users (
     joined_at TEXT NOT NULL,
     blocked INTEGER NOT NULL DEFAULT 0  -- 1 when the user blocked the bot
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_stock_available ON stock(product_id, order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 """
@@ -58,6 +62,21 @@ class Database:
             "INSERT OR IGNORE INTO users (id, username, joined_at)"
             " SELECT user_id, MAX(username), MIN(created_at) FROM orders GROUP BY user_id"
         )
+
+    # ---------- settings ----------
+    def get_setting(self, key: str, default: str) -> str:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def delete_setting(self, key: str) -> None:
+        self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
     # ---------- users ----------
     def upsert_user(self, user_id: int, username: str | None, first_name: str | None) -> None:

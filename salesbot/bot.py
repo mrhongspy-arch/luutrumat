@@ -9,7 +9,7 @@ from urllib.parse import quote
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -326,12 +326,42 @@ async def report_to_admins(app: Application, text: str) -> None:
         await app.bot.send_message(admin_id, text)
 
 
-def restock_text(product, available: int) -> str:
+# Icons in the restock notice. Admins can swap them for (animated) custom emoji
+# with /setemoji; stored as HTML so <tg-emoji> tags survive.
+EMOJI_SLOTS = {
+    "badge": ("🔥 <b>TIN NÓNG</b>", "nhãn đầu tin (TIN NÓNG)"),
+    "stock": ("📦", "biểu tượng dòng số lượng"),
+    "price": ("💰", "biểu tượng dòng giá"),
+}
+TG_EMOJI_RE = re.compile(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", re.S)
+
+
+def emoji(database: Database, slot: str) -> str:
+    return database.get_setting(f"emoji_{slot}", EMOJI_SLOTS[slot][0])
+
+
+def plain_emoji(html_text: str) -> str:
+    """Replace custom emoji with their fallback characters (for chats that reject them)."""
+    return TG_EMOJI_RE.sub(r"\1", html_text)
+
+
+def restock_text(database: Database, product, available: int) -> str:
     return (
-        f"🔥 <b>TIN NÓNG</b> — <b>{escape(product['name'])}</b> đã có hàng lại!\n\n"
-        f"📦 Số lượng còn: <b>{available}</b>\n"
-        f"💰 Giá: <b>{money(product['price'])}</b>"
+        f"{emoji(database, 'badge')} <b>{escape(product['name'])}</b> đã có hàng lại!\n\n"
+        f"{emoji(database, 'stock')} Số lượng còn: <b>{available}</b>\n"
+        f"{emoji(database, 'price')} Giá: <b>{money(product['price'])}</b>"
     )
+
+
+async def send_html(bot, chat_id, text: str, **kwargs):
+    """Send HTML, retrying without custom emoji if Telegram refuses them
+    (they need the bot owner to have Telegram Premium)."""
+    try:
+        return await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, **kwargs)
+    except BadRequest:
+        if not TG_EMOJI_RE.search(text):
+            raise
+        return await bot.send_message(chat_id, plain_emoji(text), parse_mode=ParseMode.HTML, **kwargs)
 
 
 async def announce_product(app: Application, product_id: int) -> None:
@@ -342,19 +372,19 @@ async def announce_product(app: Application, product_id: int) -> None:
     available = database.sellable_quantity(product_id)
     if product is None or not product["active"] or available == 0:
         return
-    text = restock_text(product, available)
+    text = restock_text(database, product, available)
     if config.channel_id:
         link = f"https://t.me/{app.bot.username}?start=p{product_id}"
         try:
-            await app.bot.send_message(
-                config.channel_id, text, parse_mode=ParseMode.HTML,
+            await send_html(
+                app.bot, config.channel_id, text,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Mua ngay", url=link)]]),
             )
         except TelegramError as e:
             await report_to_admins(app, f"⚠️ Không đăng được lên kênh {config.channel_id}: {e}")
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Mua ngay", callback_data=f"view:{product_id}")]])
     delivered, failed = await broadcast(
-        app, lambda chat_id: app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        app, lambda chat_id: send_html(app.bot, chat_id, text, reply_markup=markup)
     )
     await report_to_admins(app, f"📣 Đã báo có hàng {product['name']}: gửi {delivered} người, lỗi {failed}.")
 
@@ -370,6 +400,7 @@ ADMIN_HELP = """<b>Lệnh quản trị</b>
 /orders [pending|paid|cancelled] — xem đơn
 /notify ID — gửi thông báo "có hàng lại" của sản phẩm cho mọi khách
 /broadcast [ID] — trả lời (reply) một tin nhắn/ảnh bằng lệnh này để gửi nó cho mọi khách; thêm ID để gắn nút 🛒 Mua ngay
+/setemoji badge|stock|price EMOJI — đổi biểu tượng trong tin "có hàng lại" (hỗ trợ emoji động)
 /confirm MÃ_ĐƠN — xác nhận đã thanh toán và giao hàng
 /cancel MÃ_ĐƠN — huỷ đơn
 /stats — thống kê doanh thu"""
@@ -432,6 +463,42 @@ async def notify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text("📣 Đang gửi thông báo…")
     context.application.create_task(announce_product(context.application, product_id))
+
+
+@admin_only
+async def set_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    database = db(context)
+    # text_html keeps custom emoji as <tg-emoji emoji-id="..."> tags.
+    match = re.match(r"/\S+\s+(\w+)\s*(.*)", update.message.text_html, re.S)
+    slot = match.group(1).lower() if match else ""
+    if slot not in EMOJI_SLOTS:
+        lines = [f"• <code>{name}</code> — {label}: {emoji(database, name)}" for name, (_, label) in EMOJI_SLOTS.items()]
+        await update.message.reply_text(
+            "Cách dùng: <code>/setemoji badge</code> rồi chèn emoji (có thể là emoji động).\n"
+            "Gõ <code>/setemoji badge reset</code> để về mặc định.\n\nHiện tại:\n" + "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    value = match.group(2).strip()
+    if not value:
+        raise ValueError
+    if value.lower() == "reset":
+        database.delete_setting(f"emoji_{slot}")
+    else:
+        database.set_setting(f"emoji_{slot}", value)
+    sample = {"name": "Sản phẩm mẫu", "price": 190000}
+    preview = restock_text(database, sample, 4)
+    try:
+        await context.bot.send_message(update.effective_chat.id, preview, parse_mode=ParseMode.HTML)
+    except BadRequest as e:
+        await update.message.reply_text(
+            f"⚠️ Telegram không cho bot dùng emoji này ({e}).\n"
+            "Emoji động chỉ dùng được khi tài khoản đã tạo bot (chủ bot) có Telegram Premium. "
+            "Thông báo sẽ tự dùng emoji thường thay thế."
+        )
+        await send_html(context.bot, update.effective_chat.id, preview)
+        return
+    await update.message.reply_text("✅ Đã lưu. Tin \"có hàng lại\" sẽ trông như trên.")
 
 
 @admin_only
@@ -622,6 +689,7 @@ def build_application(config: Config) -> Application:
     app.add_handler(CommandHandler("orders", list_orders))
     app.add_handler(CommandHandler("notify", notify))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("setemoji", set_emoji))
     app.add_handler(CommandHandler("confirm", confirm))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stats", stats))

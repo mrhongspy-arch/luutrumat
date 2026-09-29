@@ -75,6 +75,8 @@ Bot ghi nhớ mọi người đã nhắn tin với nó, để gửi thông báo:
   Tắt bằng `AUTO_RESTOCK_NOTIFY=false`. Gửi lại bất cứ lúc nào bằng `/notify ID`.
 - **Tin khuyến mãi:** gửi cho bot một tin (chữ, hoặc ảnh kèm chú thích), rồi **Trả lời** tin đó
   bằng `/broadcast` — bot gửi y nguyên cho mọi khách. `/broadcast 3` để kèm nút Mua ngay sản phẩm #3.
+- **Emoji động (như nhãn "TIN NÓNG" nhấp nháy):** `/setemoji badge <emoji>`, `/setemoji stock <emoji>`,
+  `/setemoji price <emoji>`. Cần tài khoản chủ bot có Telegram Premium; nếu không, bot tự dùng emoji thường.
 - **Kênh Telegram (tuỳ chọn):** đặt `CHANNEL_ID=@kenhcuashop` và thêm bot làm admin kênh;
   thông báo có hàng sẽ được đăng lên kênh, nút Mua ngay mở bot đúng sản phẩm.
 
