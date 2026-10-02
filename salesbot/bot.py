@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -36,10 +37,19 @@ from .db import Database
 
 log = logging.getLogger(__name__)
 
-BTN_PRODUCTS = "🛍 Sản phẩm"
-BTN_ORDERS = "📦 Đơn hàng của tôi"
-BTN_SUPPORT = "💬 Hỗ trợ"
-MAIN_MENU = ReplyKeyboardMarkup([[BTN_PRODUCTS], [BTN_ORDERS, BTN_SUPPORT]], resize_keyboard=True)
+BTN_BUY = "🛒 Mua hàng"
+BTN_HISTORY = "📋 Lịch sử"
+BTN_CONTACT = "📞 Liên hệ"
+BTN_WALLET = "💳 Ví của tôi"
+MAIN_MENU = ReplyKeyboardMarkup(
+    [[BTN_BUY, BTN_HISTORY], [BTN_CONTACT, BTN_WALLET]], resize_keyboard=True, is_persistent=True
+)
+# Buttons of the previous menu, still on some customers' screens.
+OLD_BTN_PRODUCTS = "🛍 Sản phẩm"
+OLD_BTN_ORDERS = "📦 Đơn hàng của tôi"
+OLD_BTN_SUPPORT = "💬 Hỗ trợ"
+TOPUP_AMOUNTS = (50_000, 100_000, 200_000, 500_000, 1_000_000, 2_000_000)
+MIN_TOPUP, MAX_TOPUP = 10_000, 50_000_000
 MAX_QTY_BUTTONS = 5
 STATUS_LABEL = {"pending": "⏳ Chờ thanh toán", "paid": "✅ Đã giao", "cancelled": "❌ Đã huỷ"}
 
@@ -77,41 +87,76 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Deep link from a channel post: t.me/<bot>?start=p<product_id>
-    if context.args and re.fullmatch(r"p\d+", context.args[0]):
-        await update.message.reply_text("👋 Chào bạn! Đây là sản phẩm bạn quan tâm:", reply_markup=MAIN_MENU)
-        view = product_view(context, int(context.args[0][1:]))
-        if view:
-            await update.message.reply_text(view[0], parse_mode=ParseMode.HTML, reply_markup=view[1])
-            return
     name = escape(update.effective_user.first_name or "bạn")
     await update.message.reply_text(
-        f"👋 Xin chào <b>{name}</b>!\nChào mừng đến với cửa hàng. Chọn một mục bên dưới để bắt đầu.",
+        f"👋 Xin chào <b>{name}</b>!\nChào mừng đến với cửa hàng. Chọn chức năng ở menu bên dưới 👇",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_MENU,
     )
+    # Deep link from a channel post: t.me/<bot>?start=p<product_id>
+    if context.args and re.fullmatch(r"p\d+", context.args[0]):
+        product_id = int(context.args[0][1:])
+        if product_view(context, product_id, False):
+            await show_view(update, lambda icons: product_view(context, product_id, icons), reply=True)
+            return
+    await show_products(update, context)
 
+
+async def legacy_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Buttons of the old reply keyboard: hand out the new menu, then do what was asked."""
+    await update.message.reply_text("🔄 Menu đã được cập nhật 👇", reply_markup=MAIN_MENU)
+    target = {OLD_BTN_PRODUCTS: show_products, OLD_BTN_ORDERS: show_history, OLD_BTN_SUPPORT: show_contact}
+    await target[update.message.text](update, context)
+
+
+# ---------------------------------------------------------------- views
+# Each *_view returns (html_text, inline_markup). ``icons`` says whether custom
+# emoji logos may be used; show_view retries with icons=False if Telegram refuses.
 
 OTHER_CATEGORY = 0  # callback id for products that are not in any category
 
 
-def category_button(category, label: str, callback: str, icons: bool) -> InlineKeyboardButton:
-    """Button with the category logo (custom emoji) or, failing that, its plain emoji."""
-    if icons and category["icon_id"]:
-        return InlineKeyboardButton(label, callback_data=callback, icon_custom_emoji_id=category["icon_id"])
-    prefix = f"{category['emoji']} " if category["emoji"] else ""
-    return InlineKeyboardButton(prefix + label, callback_data=callback)
+def logo_button(label: str, callback: str, icons: bool, *sources) -> InlineKeyboardButton:
+    """Button with the first available logo (custom emoji) among ``sources``,
+    or, without logos, the first plain emoji."""
+    sources = [s for s in sources if s is not None]
+    icon_id = next((s["icon_id"] for s in sources if s["icon_id"]), "")
+    if icons and icon_id:
+        return InlineKeyboardButton(label, callback_data=callback, icon_custom_emoji_id=icon_id)
+    plain = next((s["emoji"] for s in sources if s["emoji"]), "")
+    return InlineKeyboardButton(f"{plain} {label}" if plain else label, callback_data=callback)
 
 
-def product_button(context: ContextTypes.DEFAULT_TYPE, product, category, icons: bool) -> InlineKeyboardButton:
-    label = f"{product['name']} — {money(product['price'])} (còn {db(context).sellable_quantity(product['id'])})"
-    if category is None:
-        return InlineKeyboardButton(label, callback_data=f"prod:{product['id']}")
-    return category_button(category, label, f"prod:{product['id']}", icons)
+def logo_html(icons: bool, *sources) -> str:
+    """Logo to put in front of a title inside a message."""
+    sources = [s for s in sources if s is not None]
+    plain = next((s["emoji"] for s in sources if s["emoji"]), "")
+    icon_id = next((s["icon_id"] for s in sources if s["icon_id"]), "")
+    if icons and icon_id:
+        return f'<tg-emoji emoji-id="{icon_id}">{plain or "⭐"}</tg-emoji> '
+    return f"{plain} " if plain else ""
 
 
 def in_pairs(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
     return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+
+def back_button(callback: str) -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton("◀️ Quay lại", callback_data=callback)]
+
+
+def home_view(context: ContextTypes.DEFAULT_TYPE, icons: bool):
+    buttons = [
+        InlineKeyboardButton(BTN_BUY, callback_data="list"),
+        InlineKeyboardButton(BTN_HISTORY, callback_data="hist"),
+        InlineKeyboardButton(BTN_CONTACT, callback_data="contact"),
+        InlineKeyboardButton(BTN_WALLET, callback_data="wallet"),
+    ]
+    return "🏠 <b>Menu chính</b>\nChọn chức năng:", InlineKeyboardMarkup(in_pairs(buttons))
+
+
+def product_label(context: ContextTypes.DEFAULT_TYPE, product) -> str:
+    return f"{product['name']} — {money(product['price'])} (còn {db(context).sellable_quantity(product['id'])})"
 
 
 def catalog_view(context: ContextTypes.DEFAULT_TYPE, icons: bool):
@@ -120,45 +165,122 @@ def catalog_view(context: ContextTypes.DEFAULT_TYPE, icons: bool):
     categories = database.list_categories()
     if not categories:
         products = database.list_products()
-        if not products:
-            return "Hiện chưa có sản phẩm nào.", None
-        rows = [[product_button(context, p, None, icons)] for p in products]
-        return "🛍 <b>Danh sách sản phẩm</b>\nChọn sản phẩm để xem chi tiết:", InlineKeyboardMarkup(rows)
+        rows = [[logo_button(product_label(context, p), f"prod:{p['id']}", icons, p)] for p in products]
+        rows.append(back_button("home"))
+        text = "🛍 <b>Danh sách sản phẩm</b>\nChọn sản phẩm để xem chi tiết:" if products else "Hiện chưa có sản phẩm nào."
+        return text, InlineKeyboardMarkup(rows)
     buttons = []
     for c in categories:
         products = database.products_in_category(c["id"])
         if products:
             stock = sum(database.sellable_quantity(p["id"]) for p in products)
-            buttons.append(category_button(c, f"{c['name']} ({stock})", f"cat:{c['id']}", icons))
+            buttons.append(logo_button(f"{c['name']} ({stock})", f"cat:{c['id']}", icons, c))
     others = database.products_in_category(None)
     if others:
         stock = sum(database.sellable_quantity(p["id"]) for p in others)
         buttons.append(InlineKeyboardButton(f"📦 Khác ({stock})", callback_data=f"cat:{OTHER_CATEGORY}"))
-    if not buttons:
-        return "Hiện chưa có sản phẩm nào.", None
-    return "📂 <b>Chọn nhóm sản phẩm:</b>", InlineKeyboardMarkup(in_pairs(buttons))
+    rows = in_pairs(buttons) + [back_button("home")]
+    text = "📂 <b>Chọn nhóm sản phẩm:</b>" if buttons else "Hiện chưa có sản phẩm nào."
+    return text, InlineKeyboardMarkup(rows)
 
 
 def category_view(context: ContextTypes.DEFAULT_TYPE, category_id: int, icons: bool):
     database = db(context)
     category = database.get_category(category_id) if category_id != OTHER_CATEGORY else None
     products = database.products_in_category(None if category is None else category_id)
-    title = escape(category["name"]) if category else "Khác"
-    rows = [[product_button(context, p, category, icons)] for p in products]
-    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="list")])
-    text = f"📂 <b>{title}</b>\nChọn sản phẩm để xem chi tiết:" if products else f"📂 <b>{title}</b>\nNhóm này chưa có sản phẩm."
+    title = (logo_html(icons, category) + escape(category["name"])) if category else "📦 Khác"
+    rows = [[logo_button(product_label(context, p), f"prod:{p['id']}", icons, p, category)] for p in products]
+    rows.append(back_button("list"))
+    hint = "Chọn sản phẩm để xem chi tiết:" if products else "Nhóm này chưa có sản phẩm."
+    return f"<b>{title}</b>\n{hint}", InlineKeyboardMarkup(rows)
+
+
+def product_view(context: ContextTypes.DEFAULT_TYPE, product_id: int, icons: bool):
+    """Text and buttons for one product, or None if it is gone or hidden."""
+    database = db(context)
+    product = database.get_product(product_id)
+    if product is None or not product["active"]:
+        return None
+    category = database.get_category(product["category_id"]) if product["category_id"] else None
+    available = database.sellable_quantity(product_id)
+    text = (
+        f"{logo_html(icons, product, category)}<b>{escape(product['name'])}</b>\n\n{escape(product['description'])}\n\n"
+        f"💰 Giá: <b>{money(product['price'])}</b>\n📦 Còn lại: <b>{available}</b>"
+    )
+    rows = []
+    if available > 0:
+        rows.append([
+            InlineKeyboardButton(f"Mua {q}", callback_data=f"buy:{product_id}:{q}")
+            for q in range(1, min(available, MAX_QTY_BUTTONS) + 1)
+        ])
+    else:
+        text += "\n\n⚠️ Sản phẩm tạm hết hàng."
+    back = "list"
+    if product["category_id"]:
+        back = f"cat:{product['category_id']}"
+    elif database.list_categories():
+        back = f"cat:{OTHER_CATEGORY}"
+    rows.append(back_button(back))
     return text, InlineKeyboardMarkup(rows)
 
 
-async def show_view(update: Update, build) -> None:
-    """Show ``build(icons)`` by editing the pressed message or replying.
+def history_view(context: ContextTypes.DEFAULT_TYPE, user_id: int, icons: bool):
+    orders = db(context).list_user_orders(user_id)
+    if not orders:
+        return "📋 <b>Lịch sử mua hàng</b>\nBạn chưa có đơn hàng nào.", InlineKeyboardMarkup([back_button("home")])
+    lines = ["📋 <b>Lịch sử mua hàng</b>"]
+    rows = []
+    for o in orders:
+        lines.append(
+            f"• <code>{o['code']}</code> — {escape(o['product_name'])} × {o['quantity']} — "
+            f"{money(o['amount'])} — {STATUS_LABEL[o['status']]}"
+        )
+        if o["status"] == "paid":
+            rows.append([InlineKeyboardButton(f"📥 Xem lại hàng {o['code']}", callback_data=f"items:{o['id']}")])
+    rows.append(back_button("home"))
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def contact_view(context: ContextTypes.DEFAULT_TYPE, icons: bool):
+    contact = escape(cfg(context).support_contact or "admin")
+    return f"📞 <b>Liên hệ</b>\nCần hỗ trợ? Nhắn cho {contact}", InlineKeyboardMarkup([back_button("home")])
+
+
+TX_LABEL = {"deposit": "Nạp tiền", "purchase": "Mua hàng", "adjust": "Điều chỉnh"}
+
+
+def wallet_view(context: ContextTypes.DEFAULT_TYPE, user_id: int, icons: bool):
+    database = db(context)
+    lines = [f"💳 <b>Ví của tôi</b>\nSố dư: <b>{money(database.get_balance(user_id))}</b>"]
+    history = database.wallet_history(user_id, 5)
+    if history:
+        lines.append("\n<b>Giao dịch gần đây</b>")
+        for tx in history:
+            sign = "+" if tx["amount"] > 0 else "−"
+            lines.append(f"• {sign}{money(abs(tx['amount']))} — {TX_LABEL.get(tx['kind'], tx['kind'])} {escape(tx['ref'])}")
+    lines.append("\nDùng số dư để mua hàng ngay, không cần chuyển khoản từng đơn.")
+    rows = [[InlineKeyboardButton("➕ Nạp tiền", callback_data="topup")], back_button("home")]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def topup_view(context: ContextTypes.DEFAULT_TYPE, icons: bool):
+    buttons = [InlineKeyboardButton(money(a), callback_data=f"dep:{a}") for a in TOPUP_AMOUNTS]
+    text = (
+        "➕ <b>Nạp tiền vào ví</b>\nChọn số tiền muốn nạp:\n\n"
+        f"Hoặc gõ <code>/nap SỐ_TIỀN</code> để nạp số khác (tối thiểu {money(MIN_TOPUP)}), ví dụ <code>/nap 150000</code>"
+    )
+    return text, InlineKeyboardMarkup(in_pairs(buttons) + [back_button("wallet")])
+
+
+async def show_view(update: Update, build, reply: bool = False) -> None:
+    """Show ``build(icons)`` by editing the pressed message, or as a new message.
 
     Custom-emoji logos need the bot owner to have Telegram Premium; if Telegram
     refuses them, the same view is sent again with plain emoji."""
     for icons in (True, False):
         text, markup = build(icons)
         try:
-            if update.callback_query:
+            if update.callback_query and not reply:
                 await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             else:
                 await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -166,49 +288,48 @@ async def show_view(update: Update, build) -> None:
         except BadRequest as e:
             if "not modified" in str(e).lower():
                 return
+            if "no text in the message" in str(e).lower():  # pressed under a photo: answer in a new message
+                reply = True
+                continue
             if not icons:
                 raise
-            log.info("Custom emoji buttons refused, falling back to plain emoji: %s", e)
+            log.info("Custom emoji refused, falling back to plain emoji: %s", e)
 
 
 async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await show_view(update, lambda icons: catalog_view(context, icons))
 
 
-def product_view(context: ContextTypes.DEFAULT_TYPE, product_id: int):
-    """Text and buttons for one product, or None if it is gone or hidden."""
-    product = db(context).get_product(product_id)
-    if product is None or not product["active"]:
-        return None
-    available = db(context).sellable_quantity(product_id)
-    text = (
-        f"<b>{escape(product['name'])}</b>\n\n{escape(product['description'])}\n\n"
-        f"💰 Giá: <b>{money(product['price'])}</b>\n📦 Còn lại: <b>{available}</b>"
-    )
-    rows = []
-    if available > 0:
-        qty_buttons = [
-            InlineKeyboardButton(f"Mua {q}", callback_data=f"buy:{product_id}:{q}")
-            for q in range(1, min(available, MAX_QTY_BUTTONS) + 1)
-        ]
-        rows.append(qty_buttons)
-    else:
-        text += "\n\n⚠️ Sản phẩm tạm hết hàng."
-    back = "list"
-    if product["category_id"]:
-        back = f"cat:{product['category_id']}"
-    elif db(context).list_categories():
-        back = f"cat:{OTHER_CATEGORY}"
-    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data=back)])
-    return text, InlineKeyboardMarkup(rows)
+async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_view(update, lambda icons: history_view(context, update.effective_user.id, icons))
 
 
-async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
-    view = product_view(context, product_id)
-    if view is None:
-        await update.callback_query.edit_message_text("Sản phẩm không còn tồn tại.")
+async def show_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_view(update, lambda icons: contact_view(context, icons))
+
+
+async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_view(update, lambda icons: wallet_view(context, update.effective_user.id, icons))
+
+
+async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int, reply: bool = False) -> None:
+    if product_view(context, product_id, False) is None:
+        await update.effective_message.reply_text("Sản phẩm không còn tồn tại.")
         return
-    await update.callback_query.edit_message_text(view[0], parse_mode=ParseMode.HTML, reply_markup=view[1])
+    await show_view(update, lambda icons: product_view(context, product_id, icons), reply=reply)
+
+
+def payment_caption(config: Config, title: str, code: str, amount: int, details: str) -> str:
+    return (
+        f"🧾 <b>{title} {code}</b>\n{details}"
+        f"Số tiền: <b>{money(amount)}</b>\n\n"
+        f"🏦 Ngân hàng: <b>{escape(config.bank_code)}</b>\n"
+        f"💳 STK: <code>{escape(config.bank_account)}</code>\n"
+        f"👤 Chủ TK: {escape(config.bank_account_name)}\n"
+        f"📝 Nội dung CK: <code>{code}</code>\n\n"
+        f"Quét mã QR hoặc chuyển khoản đúng <b>số tiền</b> và <b>nội dung</b>.\n"
+        f"⏰ Tự huỷ sau {config.order_timeout_minutes} phút nếu chưa thanh toán."
+    )
 
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int, qty: int) -> None:
@@ -220,61 +341,116 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: in
         await query.answer("Không đủ hàng, vui lòng chọn số lượng khác.", show_alert=True)
         await show_product(update, context, product_id)
         return
-
-    caption = (
-        f"🧾 <b>Đơn hàng {order['code']}</b>\n"
-        f"Sản phẩm: {escape(order['product_name'])} × {qty}\n"
-        f"Tổng tiền: <b>{money(order['amount'])}</b>\n\n"
-        f"🏦 Ngân hàng: <b>{escape(config.bank_code)}</b>\n"
-        f"💳 STK: <code>{escape(config.bank_account)}</code>\n"
-        f"👤 Chủ TK: {escape(config.bank_account_name)}\n"
-        f"📝 Nội dung CK: <code>{order['code']}</code>\n\n"
-        f"Quét mã QR hoặc chuyển khoản đúng <b>số tiền</b> và <b>nội dung</b>. "
-        f"Hàng sẽ được gửi tự động ngay khi thanh toán được xác nhận.\n"
-        f"⏰ Đơn tự huỷ sau {config.order_timeout_minutes} phút."
-    )
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Huỷ đơn", callback_data=f"cancel:{order['id']}")]])
+    await query.answer()
+    caption = payment_caption(
+        config, "Đơn hàng", order["code"], order["amount"],
+        f"Sản phẩm: {escape(order['product_name'])} × {qty}\n",
+    ) + "\nHàng sẽ được gửi tự động ngay khi thanh toán được xác nhận."
+    rows = []
+    balance = db(context).get_balance(user.id)
+    if balance >= order["amount"]:
+        rows.append([InlineKeyboardButton(f"💳 Trả bằng ví (số dư {money(balance)})", callback_data=f"payw:{order['id']}")])
+    rows.append([InlineKeyboardButton("❌ Huỷ đơn", callback_data=f"cancel:{order['id']}")])
     await query.message.reply_photo(
         qr_url(config, order["amount"], order["code"]),
         caption=caption,
         parse_mode=ParseMode.HTML,
-        reply_markup=markup,
+        reply_markup=InlineKeyboardMarkup(rows),
     )
     await notify_admins_new_order(context.application, order)
 
 
-async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    orders = db(context).list_user_orders(update.effective_user.id)
-    if not orders:
-        await update.message.reply_text("Bạn chưa có đơn hàng nào.")
+async def pay_with_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int) -> None:
+    query = update.callback_query
+    items, error = db(context).pay_with_wallet(order_id, update.effective_user.id)
+    if items is None:
+        message = {
+            "not_enough": "Số dư ví không đủ. Hãy nạp thêm hoặc chuyển khoản theo mã QR.",
+            "out_of_stock": "Sản phẩm vừa hết hàng, đơn chưa bị trừ tiền.",
+        }.get(error, "Đơn này không còn chờ thanh toán.")
+        await query.answer(message, show_alert=True)
         return
-    lines = ["📦 <b>Đơn hàng gần đây</b>"]
-    buttons = []
-    for o in orders:
-        lines.append(
-            f"• <code>{o['code']}</code> — {escape(o['product_name'])} × {o['quantity']} — "
-            f"{money(o['amount'])} — {STATUS_LABEL[o['status']]}"
-        )
-        if o["status"] == "paid":
-            buttons.append([InlineKeyboardButton(f"📥 Xem lại hàng {o['code']}", callback_data=f"items:{o['id']}")])
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    await query.answer("Thanh toán thành công!")
+    order = db(context).get_order(order_id)
+    await query.edit_message_caption(
+        f"✅ Đơn {order['code']} đã thanh toán bằng ví.\n"
+        f"Số dư còn lại: {money(db(context).get_balance(order['user_id']))}"
+    )
+    await send_items(context.application, order, items)
+    await report_to_admins(
+        context.application, f"✅ Đã giao đơn {order['code']} ({money(order['amount'])}) — trả bằng ví."
     )
 
 
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    contact = cfg(context).support_contact or "admin"
-    await update.message.reply_text(f"💬 Cần hỗ trợ? Liên hệ {contact}")
+async def create_topup(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int) -> None:
+    user = update.effective_user
+    config = cfg(context)
+    deposit = db(context).create_deposit(config.deposit_prefix, user.id, user.username, amount)
+    caption = payment_caption(config, "Nạp tiền", deposit["code"], amount, "") + (
+        "\nTiền sẽ được cộng vào ví ngay khi nhận được chuyển khoản."
+    )
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Huỷ nạp", callback_data=f"depx:{deposit['id']}")]])
+    await update.effective_message.reply_photo(
+        qr_url(config, amount, deposit["code"]), caption=caption, parse_mode=ParseMode.HTML, reply_markup=markup
+    )
+    buyer = f"@{user.username}" if user.username else str(user.id)
+    admin_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Đã nhận tiền", callback_data=f"dok:{deposit['id']}"),
+        InlineKeyboardButton("❌ Huỷ", callback_data=f"dno:{deposit['id']}"),
+    ]])
+    for admin_id in config.admin_ids:
+        await context.bot.send_message(
+            admin_id,
+            f"💳 Yêu cầu nạp tiền <code>{deposit['code']}</code> — <b>{money(amount)}</b>\nKhách: {escape(buyer)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_markup,
+        )
+
+
+async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    digits = re.sub(r"\D", "", " ".join(context.args))
+    if not digits or not MIN_TOPUP <= int(digits) <= MAX_TOPUP:
+        await update.message.reply_text(
+            f"Cách dùng: /nap SỐ_TIỀN (từ {money(MIN_TOPUP)} đến {money(MAX_TOPUP)}), ví dụ /nap 150000"
+        )
+        return
+    await create_topup(update, context, int(digits))
+
+
+async def credit_deposit(app: Application, deposit_id: int, received: int | None = None) -> bool:
+    """Add a pending deposit to the customer's wallet and tell everyone."""
+    database: Database = app.bot_data["db"]
+    deposit = database.confirm_deposit(deposit_id, received)
+    if deposit is None:
+        return False
+    balance = database.get_balance(deposit["user_id"])
+    try:
+        await app.bot.send_message(
+            deposit["user_id"],
+            f"✅ Nạp thành công <b>{money(deposit['credited'])}</b> (mã {deposit['code']}).\n"
+            f"💳 Số dư ví: <b>{money(balance)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        log.warning("Could not notify user %s about deposit %s", deposit["user_id"], deposit["code"])
+    await report_to_admins(app, f"💳 Đã cộng {money(deposit['credited'])} cho nạp {deposit['code']}.")
+    return True
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action, *args = query.data.split(":")
-    if action == "list":
+    simple = {
+        "home": lambda: show_view(update, lambda icons: home_view(context, icons)),
+        "list": lambda: show_products(update, context),
+        "hist": lambda: show_history(update, context),
+        "contact": lambda: show_contact(update, context),
+        "wallet": lambda: show_wallet(update, context),
+        "topup": lambda: show_view(update, lambda icons: topup_view(context, icons)),
+    }
+    if action in simple:
         await query.answer()
-        await show_products(update, context)
+        await simple[action]()
     elif action == "cat":
         await query.answer()
         await show_view(update, lambda icons: category_view(context, int(args[0]), icons))
@@ -285,14 +461,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # "Mua ngay" under an announcement: open the product in a new message,
         # leaving the announcement itself untouched.
         await query.answer()
-        view = product_view(context, int(args[0]))
-        if view is None:
-            await query.message.reply_text("Sản phẩm không còn tồn tại.")
-        else:
-            await query.message.reply_text(view[0], parse_mode=ParseMode.HTML, reply_markup=view[1])
+        await show_product(update, context, int(args[0]), reply=True)
     elif action == "buy":
-        await query.answer()
         await buy(update, context, int(args[0]), int(args[1]))
+    elif action == "payw":
+        await pay_with_wallet(update, context, int(args[0]))
+    elif action == "dep":
+        await query.answer()
+        await create_topup(update, context, int(args[0]))
+    elif action == "depx":
+        deposit = db(context).get_deposit(int(args[0]))
+        if deposit and deposit["user_id"] == update.effective_user.id and db(context).cancel_deposit(deposit["id"]):
+            await query.answer("Đã huỷ yêu cầu nạp.")
+            await query.edit_message_caption(f"❌ Yêu cầu nạp {deposit['code']} đã huỷ.")
+        else:
+            await query.answer("Không thể huỷ yêu cầu này.", show_alert=True)
     elif action == "cancel":
         order = db(context).get_order(int(args[0]))
         if order and order["user_id"] == update.effective_user.id and db(context).cancel_order(order["id"]):
@@ -320,6 +503,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_reply_markup(None)
         else:
             await query.answer("Không thể huỷ đơn này.", show_alert=True)
+    elif action == "dok" and is_admin(update, context):
+        ok = await credit_deposit(context.application, int(args[0]))
+        await query.answer("Đã cộng tiền vào ví." if ok else "Yêu cầu không còn chờ duyệt.", show_alert=not ok)
+        if ok:
+            await query.edit_message_reply_markup(None)
+    elif action == "dno" and is_admin(update, context):
+        deposit = db(context).get_deposit(int(args[0]))
+        if deposit and db(context).cancel_deposit(deposit["id"]):
+            await context.bot.send_message(deposit["user_id"], f"❌ Yêu cầu nạp {deposit['code']} đã bị huỷ bởi cửa hàng.")
+            await query.answer("Đã huỷ.")
+            await query.edit_message_reply_markup(None)
+        else:
+            await query.answer("Không thể huỷ yêu cầu này.", show_alert=True)
     else:
         await query.answer()
 
@@ -372,6 +568,11 @@ async def expire_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(order["user_id"], f"⌛ Đơn {order['code']} đã hết hạn thanh toán và bị huỷ.")
         except Exception:  # user blocked the bot, etc.
             log.warning("Could not notify user %s about expired order", order["user_id"])
+    for deposit in db(context).expire_deposits(cfg(context).order_timeout_minutes):
+        try:
+            await context.bot.send_message(deposit["user_id"], f"⌛ Yêu cầu nạp {deposit['code']} đã hết hạn và bị huỷ.")
+        except Exception:
+            log.warning("Could not notify user %s about expired deposit", deposit["user_id"])
 
 
 # ---------------------------------------------------------------- announcements
@@ -428,9 +629,16 @@ def plain_emoji(html_text: str) -> str:
     return TG_EMOJI_RE.sub(r"\1", html_text)
 
 
+def product_logo(database: Database, product) -> str:
+    if "icon_id" not in product.keys():  # sample products in previews
+        return ""
+    category = database.get_category(product["category_id"]) if product["category_id"] else None
+    return logo_html(True, product, category)
+
+
 def restock_text(database: Database, product, available: int) -> str:
     return (
-        f"{emoji(database, 'badge')} <b>{escape(product['name'])}</b> đã có hàng lại!\n\n"
+        f"{emoji(database, 'badge')} {product_logo(database, product)}<b>{escape(product['name'])}</b> đã có hàng lại!\n\n"
         f"{emoji(database, 'stock')} Số lượng còn: <b>{available}</b>\n"
         f"{emoji(database, 'price')} Giá: <b>{money(product['price'])}</b>"
     )
@@ -809,11 +1017,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def add_payment_route(web_app: web.Application, app: Application) -> None:
     """HTTP endpoint for bank-transfer notifications (SePay, Casso, ...).
 
-    Finds the order code in the transfer description and delivers the order
-    automatically when the received amount covers it.
+    Finds the order or top-up code in the transfer description: orders are
+    delivered when the received amount covers them, top-ups credit the amount
+    actually received.
     """
     config: Config = app.bot_data["config"]
-    code_re = re.compile(rf"{re.escape(config.order_prefix)}[A-Z0-9]{{6}}")
+    prefixes = "|".join(re.escape(p) for p in (config.order_prefix, config.deposit_prefix))
+    code_re = re.compile(rf"(?:{prefixes})[A-Z0-9]{{6}}")
 
     def authorized(request: web.Request) -> bool:
         header = request.headers.get("Authorization", "")
@@ -834,6 +1044,11 @@ def add_payment_route(web_app: web.Application, app: Application) -> None:
             amount = int(tx.get("transferAmount") or tx.get("amount") or 0)
             match = code_re.search(description.replace(" ", ""))
             if not match:
+                continue
+            deposit = app.bot_data["db"].get_deposit_by_code(match.group(0))
+            if deposit is not None:
+                if deposit["status"] == "pending" and amount > 0:
+                    await credit_deposit(app, deposit["id"], received=amount)
                 continue
             order = app.bot_data["db"].get_order_by_code(match.group(0))
             if order is None or order["status"] != "pending":
@@ -905,6 +1120,10 @@ async def web_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(app: Application) -> None:
     config: Config = app.bot_data["config"]
+    try:  # the blue "Menu" button next to the message box
+        await app.bot.set_my_commands([BotCommand("start", "🏠 Mở menu chính"), BotCommand("nap", "💳 Nạp tiền vào ví")])
+    except Exception as e:
+        log.warning("Could not set bot commands: %s", e)
     web_app = web.Application(client_max_size=20 * 1024 * 1024)
     if config.webhook_enabled:
         add_payment_route(web_app, app)
@@ -959,9 +1178,12 @@ def build_application(config: Config) -> Application:
     app.add_handler(CommandHandler("confirm", confirm))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(MessageHandler(filters.Text([BTN_PRODUCTS]), show_products))
-    app.add_handler(MessageHandler(filters.Text([BTN_ORDERS]), my_orders))
-    app.add_handler(MessageHandler(filters.Text([BTN_SUPPORT]), support))
+    app.add_handler(CommandHandler("nap", topup_cmd))
+    app.add_handler(MessageHandler(filters.Text([BTN_BUY]), show_products))
+    app.add_handler(MessageHandler(filters.Text([BTN_HISTORY]), show_history))
+    app.add_handler(MessageHandler(filters.Text([BTN_CONTACT]), show_contact))
+    app.add_handler(MessageHandler(filters.Text([BTN_WALLET]), show_wallet))
+    app.add_handler(MessageHandler(filters.Text([OLD_BTN_PRODUCTS, OLD_BTN_ORDERS, OLD_BTN_SUPPORT]), legacy_button))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     app.job_queue.run_repeating(expire_job, interval=60, first=10)

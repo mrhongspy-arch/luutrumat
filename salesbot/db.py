@@ -61,6 +61,26 @@ CREATE TABLE IF NOT EXISTS posts (
     failed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deposits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    amount INTEGER NOT NULL,                 -- requested amount
+    credited INTEGER NOT NULL DEFAULT 0,     -- amount actually added to the wallet
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | paid | cancelled
+    created_at TEXT NOT NULL,
+    paid_at TEXT
+);
+CREATE TABLE IF NOT EXISTS wallet_tx (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL,                 -- positive = money in, negative = spent
+    kind TEXT NOT NULL,                      -- deposit | purchase | adjust
+    ref TEXT NOT NULL DEFAULT '',            -- deposit/order code or admin note
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_tx_user ON wallet_tx(user_id);
 CREATE INDEX IF NOT EXISTS idx_stock_available ON stock(product_id, order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 """
@@ -76,14 +96,21 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
-        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(products)")}
-        if "category_id" not in columns:  # databases created before categories existed
-            self.conn.execute("ALTER TABLE products ADD COLUMN category_id INTEGER REFERENCES categories(id)")
+        # Columns added after the first release; older databases get them here.
+        self._add_column("products", "category_id", "INTEGER REFERENCES categories(id)")
+        self._add_column("products", "emoji", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("products", "icon_id", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("users", "balance", "INTEGER NOT NULL DEFAULT 0")
         # Customers who ordered before the users table existed still get announcements.
         self.conn.execute(
             "INSERT OR IGNORE INTO users (id, username, joined_at)"
             " SELECT user_id, MAX(username), MIN(created_at) FROM orders GROUP BY user_id"
         )
+
+    def _add_column(self, table: str, column: str, definition: str) -> None:
+        columns = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     # ---------- settings ----------
     def get_setting(self, key: str, default: str) -> str:
@@ -129,6 +156,9 @@ class Database:
             "UPDATE products SET active = ? WHERE id = ?", (int(active), product_id)
         )
         return cur.rowcount > 0
+
+    def set_product_icon(self, product_id: int, emoji: str, icon_id: str) -> None:
+        self.conn.execute("UPDATE products SET emoji = ?, icon_id = ? WHERE id = ?", (emoji, icon_id, product_id))
 
     def set_product_price(self, product_id: int, price: int) -> bool:
         cur = self.conn.execute(
@@ -283,29 +313,160 @@ class Database:
         """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            items = self._fulfil(order_id)
+            self.conn.execute("COMMIT" if items is not None else "ROLLBACK")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return items
+
+    def _fulfil(self, order_id: int) -> list[str] | None:
+        """Allocate stock and mark paid; the caller owns the transaction."""
+        order = self.get_order(order_id)
+        if order is None or order["status"] != "pending":
+            return None
+        rows = self.conn.execute(
+            "SELECT id, content FROM stock WHERE product_id = ? AND order_id IS NULL ORDER BY id LIMIT ?",
+            (order["product_id"], order["quantity"]),
+        ).fetchall()
+        if len(rows) < order["quantity"]:
+            return None
+        self.conn.executemany("UPDATE stock SET order_id = ? WHERE id = ?", [(order_id, r["id"]) for r in rows])
+        self.conn.execute("UPDATE orders SET status = 'paid', paid_at = ? WHERE id = ?", (_now(), order_id))
+        return [r["content"] for r in rows]
+
+    def pay_with_wallet(self, order_id: int, user_id: int) -> tuple[list[str] | None, str]:
+        """Pay a pending order from the buyer's wallet.
+
+        Returns (items, "") on success, or (None, reason) where reason is
+        "not_found", "not_enough" or "out_of_stock".
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
             order = self.get_order(order_id)
-            if order is None or order["status"] != "pending":
+            if order is None or order["user_id"] != user_id or order["status"] != "pending":
                 self.conn.execute("ROLLBACK")
-                return None
-            rows = self.conn.execute(
-                "SELECT id, content FROM stock WHERE product_id = ? AND order_id IS NULL"
-                " ORDER BY id LIMIT ?",
-                (order["product_id"], order["quantity"]),
-            ).fetchall()
-            if len(rows) < order["quantity"]:
+                return None, "not_found"
+            if self.get_balance(user_id) < order["amount"]:
                 self.conn.execute("ROLLBACK")
-                return None
-            self.conn.executemany(
-                "UPDATE stock SET order_id = ? WHERE id = ?", [(order_id, r["id"]) for r in rows]
-            )
-            self.conn.execute(
-                "UPDATE orders SET status = 'paid', paid_at = ? WHERE id = ?", (_now(), order_id)
-            )
+                return None, "not_enough"
+            items = self._fulfil(order_id)
+            if items is None:
+                self.conn.execute("ROLLBACK")
+                return None, "out_of_stock"
+            self._change_balance(user_id, -order["amount"], "purchase", order["code"])
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
-        return [r["content"] for r in rows]
+        return items, ""
+
+    # ---------- wallet ----------
+    def get_balance(self, user_id: int) -> int:
+        row = self.conn.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()
+        return row["balance"] if row else 0
+
+    def _change_balance(self, user_id: int, amount: int, kind: str, ref: str) -> None:
+        self.conn.execute(
+            "INSERT INTO users (id, joined_at) VALUES (?, ?) ON CONFLICT(id) DO NOTHING", (user_id, _now())
+        )
+        self.conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
+        self.conn.execute(
+            "INSERT INTO wallet_tx (user_id, amount, kind, ref, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, amount, kind, ref, _now()),
+        )
+
+    def adjust_balance(self, user_id: int, amount: int, note: str) -> int | None:
+        """Admin correction; returns the new balance, or None if it would go negative."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self.get_balance(user_id) + amount < 0:
+                self.conn.execute("ROLLBACK")
+                return None
+            self._change_balance(user_id, amount, "adjust", note)
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return self.get_balance(user_id)
+
+    def wallet_history(self, user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM wallet_tx WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
+        ).fetchall()
+
+    def users_with_balance(self, limit: int = 100) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM users WHERE balance != 0 ORDER BY balance DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def find_user(self, text: str) -> sqlite3.Row | None:
+        """Find a user by numeric id or @username."""
+        text = text.strip()
+        if text.isdigit():
+            return self.conn.execute("SELECT * FROM users WHERE id = ?", (int(text),)).fetchone()
+        return self.conn.execute(
+            "SELECT * FROM users WHERE lower(username) = lower(?)", (text.lstrip("@"),)
+        ).fetchone()
+
+    def create_deposit(self, prefix: str, user_id: int, username: str | None, amount: int) -> sqlite3.Row:
+        alphabet = string.ascii_uppercase + string.digits
+        while True:
+            code = prefix + "".join(secrets.choice(alphabet) for _ in range(6))
+            if not self.conn.execute("SELECT 1 FROM deposits WHERE code = ?", (code,)).fetchone():
+                break
+        cur = self.conn.execute(
+            "INSERT INTO deposits (code, user_id, username, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+            (code, user_id, username, amount, _now()),
+        )
+        return self.get_deposit(cur.lastrowid)
+
+    def get_deposit(self, deposit_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM deposits WHERE id = ?", (deposit_id,)).fetchone()
+
+    def get_deposit_by_code(self, code: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM deposits WHERE code = ?", (code.upper(),)).fetchone()
+
+    def confirm_deposit(self, deposit_id: int, received: int | None = None) -> sqlite3.Row | None:
+        """Credit a pending deposit (the received amount if given) to the wallet."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            deposit = self.get_deposit(deposit_id)
+            if deposit is None or deposit["status"] != "pending":
+                self.conn.execute("ROLLBACK")
+                return None
+            credit = received if received is not None else deposit["amount"]
+            self.conn.execute(
+                "UPDATE deposits SET status = 'paid', credited = ?, paid_at = ? WHERE id = ?",
+                (credit, _now(), deposit_id),
+            )
+            self._change_balance(deposit["user_id"], credit, "deposit", deposit["code"])
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return self.get_deposit(deposit_id)
+
+    def cancel_deposit(self, deposit_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE deposits SET status = 'cancelled' WHERE id = ? AND status = 'pending'", (deposit_id,)
+        )
+        return cur.rowcount > 0
+
+    def expire_deposits(self, minutes: int) -> list[sqlite3.Row]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        expired = self.conn.execute(
+            "SELECT * FROM deposits WHERE status = 'pending' AND created_at < ?", (cutoff,)
+        ).fetchall()
+        for deposit in expired:
+            self.cancel_deposit(deposit["id"])
+        return expired
+
+    def list_deposits(self, status: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        sql, params = "SELECT * FROM deposits", ()
+        if status:
+            sql, params = sql + " WHERE status = ?", (status,)
+        return self.conn.execute(sql + " ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
 
     def delivered_items(self, order_id: int) -> list[str]:
         rows = self.conn.execute(

@@ -174,6 +174,7 @@ def page(request: web.Request, title: str, body: str, active: str = "") -> web.R
             ("products", "/admin/products", "Sản phẩm & kho"),
             ("categories", "/admin/categories", "Danh mục"),
             ("orders", "/admin/orders", "Đơn hàng"),
+            ("wallet", "/admin/wallet", "Ví & nạp tiền"),
             ("posts", "/admin/posts", "Thông báo"),
         ]
     )
@@ -306,6 +307,7 @@ async def overview(request: web.Request) -> web.Response:
             ("Tổng doanh thu", money(s["total"]), f"{s['total_orders']} đơn đã giao"),
             ("Đơn chờ thanh toán", str(pending), '<a href="/admin/orders?status=pending">Xem đơn</a>'),
             ("Người dùng bot", str(db.count_users()), "nhận được thông báo"),
+            ("Nạp tiền chờ duyệt", str(len(db.list_deposits("pending"))), '<a href="/admin/wallet">Xem</a>'),
         ]
     )
     day_rows = "".join(
@@ -444,6 +446,8 @@ async def product_detail(request: web.Request) -> web.Response:
 <div class="field"><label>Tên</label><input name="name" value="{escape(p['name'])}" required></div>
 <div class="field"><label>Giá (đồng)</label><input name="price" value="{p['price']}" inputmode="numeric" required></div>
 <div class="field"><label>Nhóm</label>{category_select(db, p['category_id'])}</div>
+<div class="row"><div class="field" style="max-width:120px"><label>Emoji thường</label><input name="emoji" value="{escape(p['emoji'])}" placeholder="🤖"></div>
+<div class="field"><label>Mã logo (emoji động)</label><input name="icon_id" value="{escape(p['icon_id'])}" class="mono" placeholder="để trống = dùng logo của nhóm"></div></div>
 <div class="field"><label>Mô tả</label><textarea name="description">{escape(p['description'])}</textarea></div>
 <button>Lưu</button></form>
 <div class="actions" style="margin-top:12px">
@@ -477,6 +481,7 @@ async def update_product(request: web.Request) -> web.Response:
         db.update_product(
             p["id"], name, parse_price(str(form.get("price"))), str(form.get("description", "")).strip(), form_category(db, form)
         )
+        db.set_product_icon(p["id"], str(form.get("emoji", "")).strip()[:8], re.sub(r"\D", "", str(form.get("icon_id", ""))))
     except ValueError as e:
         raise go(f"/admin/products/{p['id']}", str(e), error=True)
     raise go(f"/admin/products/{p['id']}", "Đã lưu.")
@@ -658,6 +663,96 @@ async def update_category(request: web.Request) -> web.Response:
 async def delete_category(request: web.Request) -> web.Response:
     database(request).delete_category(int(request.match_info["id"]))
     raise go("/admin/categories", "Đã xoá nhóm.")
+
+
+# ---------------------------------------------------------------- wallet
+
+DEPOSIT_STATUS = {"pending": ("Chờ chuyển khoản", "warn"), "paid": ("Đã cộng ví", "good"), "cancelled": ("Đã huỷ", "muted")}
+
+
+async def wallet_page(request: web.Request) -> web.Response:
+    db = database(request)
+    dep_rows = []
+    for d in db.list_deposits(limit=100):
+        who = f"@{d['username']}" if d["username"] else str(d["user_id"])
+        actions = ""
+        if d["status"] == "pending":
+            actions = (
+                f"<div class='actions'><form class='inline' method='post' action='/admin/deposits/{d['id']}/confirm' "
+                f"onsubmit=\"return confirm('Xác nhận đã nhận {money(d['amount'])} và cộng vào ví khách?')\">"
+                f"<button class='small'>✅ Đã nhận tiền</button></form>"
+                f"<form class='inline' method='post' action='/admin/deposits/{d['id']}/cancel'>"
+                f"<button class='danger small'>Huỷ</button></form></div>"
+            )
+        credited = money(d["credited"]) if d["status"] == "paid" else ""
+        dep_rows.append(
+            f"<tr><td class='mono nowrap'>{d['code']}</td><td class='nowrap'>{local_time(d['created_at'])}</td>"
+            f"<td>{escape(who)}</td><td class='num'>{money(d['amount'])}</td><td class='num'>{credited}</td>"
+            f"<td>{badge(*DEPOSIT_STATUS[d['status']])}</td><td>{actions}</td></tr>"
+        )
+    deposits = "".join(dep_rows) or "<tr><td colspan=7 class='muted'>Chưa có yêu cầu nạp nào.</td></tr>"
+    users = "".join(
+        f"<tr><td>{escape('@' + u['username'] if u['username'] else (u['first_name'] or ''))}</td>"
+        f"<td class='mono'>{u['id']}</td><td class='num'>{money(u['balance'])}</td></tr>"
+        for u in db.users_with_balance()
+    ) or "<tr><td colspan=3 class='muted'>Chưa có khách nào có số dư.</td></tr>"
+    body = f"""<h1>Ví & nạp tiền</h1>
+<div class="card"><h2>Yêu cầu nạp tiền</h2>
+<p class="hint">Khách nạp qua nút 💳 Ví của tôi → ➕ Nạp tiền. Nếu bật webhook SePay/Casso, tiền được cộng tự động; nếu không, bấm ✅ khi đã thấy tiền về.</p>
+<div class="table-wrap"><table class="wide">
+<tr><th>Mã</th><th>Thời gian</th><th>Khách</th><th class="num">Yêu cầu</th><th class="num">Đã cộng</th><th>Trạng thái</th><th></th></tr>
+{deposits}</table></div></div>
+<div class="grid g2">
+<div class="card"><h2>Cộng / trừ tiền thủ công</h2><form method="post" action="/admin/wallet/adjust">
+<div class="field"><label>Khách (ID Telegram hoặc @username)</label><input name="user" required></div>
+<div class="field"><label>Số tiền (ghi dấu - để trừ, vd -50000)</label><input name="amount" required></div>
+<div class="field"><label>Ghi chú</label><input name="note" placeholder="vd: hoàn tiền đơn DH..."></div>
+<button>Lưu</button></form></div>
+<div class="card"><h2>Khách đang có số dư</h2><div class="table-wrap"><table>
+<tr><th>Khách</th><th>ID</th><th class="num">Số dư</th></tr>{users}</table></div></div></div>"""
+    return page(request, "Ví & nạp tiền", body, "wallet")
+
+
+async def confirm_deposit(request: web.Request) -> web.Response:
+    ok = await bot_module().credit_deposit(tg(request), int(request.match_info["id"]))
+    raise go("/admin/wallet", "Đã cộng tiền vào ví khách." if ok else "Yêu cầu không còn chờ duyệt.", error=not ok)
+
+
+async def cancel_deposit(request: web.Request) -> web.Response:
+    db = database(request)
+    deposit = db.get_deposit(int(request.match_info["id"]))
+    if deposit is None or not db.cancel_deposit(deposit["id"]):
+        raise go("/admin/wallet", "Không huỷ được yêu cầu này.", error=True)
+    try:
+        await tg(request).bot.send_message(deposit["user_id"], f"❌ Yêu cầu nạp {deposit['code']} đã bị huỷ bởi cửa hàng.")
+    except TelegramError:
+        pass
+    raise go("/admin/wallet", f"Đã huỷ yêu cầu {deposit['code']}.")
+
+
+async def adjust_wallet(request: web.Request) -> web.Response:
+    db = database(request)
+    form = await request.post()
+    user = db.find_user(str(form.get("user", "")))
+    if user is None:
+        raise go("/admin/wallet", "Không tìm thấy khách (khách phải từng nhắn tin với bot).", error=True)
+    raw = str(form.get("amount", "")).strip()
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        raise go("/admin/wallet", "Số tiền không hợp lệ.", error=True)
+    amount = -int(digits) if raw.startswith("-") else int(digits)
+    note = str(form.get("note", "")).strip()[:100] or "admin"
+    balance = db.adjust_balance(user["id"], amount, note)
+    if balance is None:
+        raise go("/admin/wallet", "Không trừ được: số dư khách không đủ.", error=True)
+    sign = "+" if amount > 0 else "−"
+    try:
+        await tg(request).bot.send_message(
+            user["id"], f"💳 Ví của bạn vừa được điều chỉnh {sign}{money(abs(amount))} ({note}). Số dư: {money(balance)}"
+        )
+    except TelegramError:
+        pass
+    raise go("/admin/wallet", f"Đã điều chỉnh {sign}{money(abs(amount))}. Số dư mới: {money(balance)}.")
 
 
 # ---------------------------------------------------------------- orders
@@ -1006,6 +1101,10 @@ def setup_admin(web_app: web.Application, tg_app) -> None:
     r.add_post("/admin/logout", logout)
     r.add_get("/admin/products", products)
     r.add_get("/admin/categories", categories)
+    r.add_get("/admin/wallet", wallet_page)
+    r.add_post("/admin/wallet/adjust", adjust_wallet)
+    r.add_post("/admin/deposits/{id:\\d+}/confirm", confirm_deposit)
+    r.add_post("/admin/deposits/{id:\\d+}/cancel", cancel_deposit)
     r.add_post("/admin/categories", create_category)
     r.add_post("/admin/categories/{id:\\d+}", update_category)
     r.add_post("/admin/categories/{id:\\d+}/delete", delete_category)

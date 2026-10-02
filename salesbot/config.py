@@ -18,6 +18,7 @@ class Config:
     bank_account: str
     bank_account_name: str
     order_prefix: str
+    deposit_prefix: str
     order_timeout_minutes: int
     support_contact: str
     db_path: str
@@ -46,6 +47,7 @@ def load_config() -> Config:
         bank_account=os.getenv("BANK_ACCOUNT", ""),
         bank_account_name=os.getenv("BANK_ACCOUNT_NAME", ""),
         order_prefix=os.getenv("ORDER_PREFIX", "DH").upper(),
+        deposit_prefix=os.getenv("DEPOSIT_PREFIX", "NAP").upper(),
         order_timeout_minutes=int(os.getenv("ORDER_TIMEOUT_MINUTES", "30")),
         support_contact=os.getenv("SUPPORT_CONTACT", ""),
         db_path=os.getenv("DB_PATH", "shop.db"),

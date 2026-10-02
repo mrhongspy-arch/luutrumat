@@ -87,6 +87,15 @@ Khách bấm 🛍 Sản phẩm sẽ thấy các nhóm 2 nút mỗi hàng kèm s�
 (`icon_custom_emoji_id`): lấy mã bằng lệnh `/emojiid` trong bot; chỉ hiện khi chủ bot có Telegram Premium,
 nếu không bot tự dùng emoji thường.
 
+## Menu, logo sản phẩm và ví
+
+- Bàn phím cố định 4 nút: **🛒 Mua hàng · 📋 Lịch sử · 📞 Liên hệ · 💳 Ví của tôi**, hiện ngay sau khi khách bấm Bắt đầu.
+- Mỗi sản phẩm có thể có logo riêng (Emoji thường + Mã logo ở trang sản phẩm); không đặt thì dùng logo của nhóm.
+  Mọi danh sách đều có nút **◀️ Quay lại**.
+- **Ví:** khách nạp tiền (`➕ Nạp tiền` hoặc `/nap 150000`) bằng QR với nội dung `NAPxxxxxx`; webhook SePay/Casso cộng
+  tự động số tiền thực nhận, hoặc admin bấm ✅. Khi đặt hàng, nếu đủ số dư sẽ có nút **💳 Trả bằng ví** để nhận hàng ngay.
+  Trang quản trị → **Ví & nạp tiền**: duyệt yêu cầu nạp, cộng/trừ tiền thủ công, xem khách có số dư.
+
 ## Trang quản trị web
 
 Đặt `ADMIN_PASSWORD=...` (ít nhất 8 ký tự) trong `.env`, khởi động lại bot rồi mở
