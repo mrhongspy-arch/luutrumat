@@ -10,7 +10,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    MessageEntity,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
@@ -85,25 +92,87 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+OTHER_CATEGORY = 0  # callback id for products that are not in any category
+
+
+def category_button(category, label: str, callback: str, icons: bool) -> InlineKeyboardButton:
+    """Button with the category logo (custom emoji) or, failing that, its plain emoji."""
+    if icons and category["icon_id"]:
+        return InlineKeyboardButton(label, callback_data=callback, icon_custom_emoji_id=category["icon_id"])
+    prefix = f"{category['emoji']} " if category["emoji"] else ""
+    return InlineKeyboardButton(prefix + label, callback_data=callback)
+
+
+def product_button(context: ContextTypes.DEFAULT_TYPE, product, category, icons: bool) -> InlineKeyboardButton:
+    label = f"{product['name']} — {money(product['price'])} (còn {db(context).sellable_quantity(product['id'])})"
+    if category is None:
+        return InlineKeyboardButton(label, callback_data=f"prod:{product['id']}")
+    return category_button(category, label, f"prod:{product['id']}", icons)
+
+
+def in_pairs(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
+    return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+
+def catalog_view(context: ContextTypes.DEFAULT_TYPE, icons: bool):
+    """Category menu, or a flat product list when no categories are set up."""
+    database = db(context)
+    categories = database.list_categories()
+    if not categories:
+        products = database.list_products()
+        if not products:
+            return "Hiện chưa có sản phẩm nào.", None
+        rows = [[product_button(context, p, None, icons)] for p in products]
+        return "🛍 <b>Danh sách sản phẩm</b>\nChọn sản phẩm để xem chi tiết:", InlineKeyboardMarkup(rows)
+    buttons = []
+    for c in categories:
+        products = database.products_in_category(c["id"])
+        if products:
+            stock = sum(database.sellable_quantity(p["id"]) for p in products)
+            buttons.append(category_button(c, f"{c['name']} ({stock})", f"cat:{c['id']}", icons))
+    others = database.products_in_category(None)
+    if others:
+        stock = sum(database.sellable_quantity(p["id"]) for p in others)
+        buttons.append(InlineKeyboardButton(f"📦 Khác ({stock})", callback_data=f"cat:{OTHER_CATEGORY}"))
+    if not buttons:
+        return "Hiện chưa có sản phẩm nào.", None
+    return "📂 <b>Chọn nhóm sản phẩm:</b>", InlineKeyboardMarkup(in_pairs(buttons))
+
+
+def category_view(context: ContextTypes.DEFAULT_TYPE, category_id: int, icons: bool):
+    database = db(context)
+    category = database.get_category(category_id) if category_id != OTHER_CATEGORY else None
+    products = database.products_in_category(None if category is None else category_id)
+    title = escape(category["name"]) if category else "Khác"
+    rows = [[product_button(context, p, category, icons)] for p in products]
+    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="list")])
+    text = f"📂 <b>{title}</b>\nChọn sản phẩm để xem chi tiết:" if products else f"📂 <b>{title}</b>\nNhóm này chưa có sản phẩm."
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def show_view(update: Update, build) -> None:
+    """Show ``build(icons)`` by editing the pressed message or replying.
+
+    Custom-emoji logos need the bot owner to have Telegram Premium; if Telegram
+    refuses them, the same view is sent again with plain emoji."""
+    for icons in (True, False):
+        text, markup = build(icons)
+        try:
+            if update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            else:
+                await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            if not icons:
+                raise
+            log.info("Custom emoji buttons refused, falling back to plain emoji: %s", e)
+
+
 async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    products = db(context).list_products()
-    if not products:
-        text, markup = "Hiện chưa có sản phẩm nào.", None
-    else:
-        text = "🛍 <b>Danh sách sản phẩm</b>\nChọn sản phẩm để xem chi tiết:"
-        markup = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton(
-                    f"{p['name']} — {money(p['price'])} (còn {db(context).sellable_quantity(p['id'])})",
-                    callback_data=f"prod:{p['id']}",
-                )]
-                for p in products
-            ]
-        )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    else:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    await show_view(update, lambda icons: catalog_view(context, icons))
 
 
 def product_view(context: ContextTypes.DEFAULT_TYPE, product_id: int):
@@ -125,7 +194,12 @@ def product_view(context: ContextTypes.DEFAULT_TYPE, product_id: int):
         rows.append(qty_buttons)
     else:
         text += "\n\n⚠️ Sản phẩm tạm hết hàng."
-    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="list")])
+    back = "list"
+    if product["category_id"]:
+        back = f"cat:{product['category_id']}"
+    elif db(context).list_categories():
+        back = f"cat:{OTHER_CATEGORY}"
+    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data=back)])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -201,6 +275,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "list":
         await query.answer()
         await show_products(update, context)
+    elif action == "cat":
+        await query.answer()
+        await show_view(update, lambda icons: category_view(context, int(args[0]), icons))
     elif action == "prod":
         await query.answer()
         await show_product(update, context, int(args[0]))
@@ -312,7 +389,9 @@ async def broadcast(app: Application, send) -> tuple[int, int]:
                 await send(user_id)
                 delivered += 1
             except RetryAfter as e:
-                await asyncio.sleep(e.retry_after + 1)
+                wait = e.retry_after
+                wait = wait.total_seconds() if hasattr(wait, "total_seconds") else wait
+                await asyncio.sleep(wait + 1)
                 continue
             except Forbidden:
                 database.set_user_blocked(user_id)
@@ -525,7 +604,8 @@ ADMIN_HELP = """<b>Lệnh quản trị</b>
 /cancel MÃ_ĐƠN — huỷ đơn
 /stats — thống kê doanh thu
 /web — địa chỉ trang quản trị
-/backup — gửi ngay bản sao lưu dữ liệu"""
+/backup — gửi ngay bản sao lưu dữ liệu
+/emojiid EMOJI — lấy mã của emoji động (dùng làm logo nhóm sản phẩm)"""
 
 
 def admin_only(handler):
@@ -783,6 +863,29 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 @admin_only
+async def emoji_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with the ids of the custom emoji in this message (or the replied-to one)."""
+    found = []
+    for message in (update.message, update.message.reply_to_message):
+        if message is None:
+            continue
+        for entities in (message.parse_entities([MessageEntity.CUSTOM_EMOJI]),
+                         message.parse_caption_entities([MessageEntity.CUSTOM_EMOJI])):
+            found += [(text, e.custom_emoji_id) for e, text in entities.items()]
+    if not found:
+        await update.message.reply_text(
+            "Gõ /emojiid rồi chèn emoji động (emoji của gói emoji Premium) vào cùng tin nhắn, "
+            "hoặc trả lời một tin có emoji động bằng /emojiid."
+        )
+        return
+    lines = [f"{text}  <code>{eid}</code>" for text, eid in found]
+    await update.message.reply_text(
+        "Mã emoji (chạm để sao chép), dán vào ô \"Mã logo\" ở trang quản trị → Danh mục:\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_only
 async def web_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config = cfg(context)
     if not context.application.bot_data.get("admin_enabled"):
@@ -795,7 +898,7 @@ async def web_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if ip:
         links.append(f"http://{ip}:{config.web_port}/admin (máy khác cùng Wi-Fi)")
     links.append(f"http://<tên-máy-trong-Tailscale>:{config.web_port}/admin (khi ở ngoài, qua Tailscale)")
-    await update.message.reply_text("🖥 Trang quản trị:\n" + "\n".join(links), disable_web_page_preview=True)
+    await update.message.reply_text("🖥 Trang quản trị:\n" + "\n".join(links), link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
 # ---------------------------------------------------------------- wiring
@@ -852,6 +955,7 @@ def build_application(config: Config) -> Application:
     app.add_handler(CommandHandler("setemoji", set_emoji))
     app.add_handler(CommandHandler("web", web_link))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("emojiid", emoji_id))
     app.add_handler(CommandHandler("confirm", confirm))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stats", stats))

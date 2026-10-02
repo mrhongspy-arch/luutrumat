@@ -172,6 +172,7 @@ def page(request: web.Request, title: str, body: str, active: str = "") -> web.R
         for key, href, label in [
             ("home", "/admin", "Tổng quan"),
             ("products", "/admin/products", "Sản phẩm & kho"),
+            ("categories", "/admin/categories", "Danh mục"),
             ("orders", "/admin/orders", "Đơn hàng"),
             ("posts", "/admin/posts", "Thông báo"),
         ]
@@ -344,16 +345,32 @@ async def overview(request: web.Request) -> web.Response:
 
 # ---------------------------------------------------------------- products & stock
 
+def category_select(db: Database, selected: int | None) -> str:
+    options = ["<option value=''>— Không thuộc nhóm nào —</option>"]
+    for c in db.list_categories(only_active=False):
+        mark = "selected" if c["id"] == selected else ""
+        options.append(f"<option value='{c['id']}' {mark}>{escape((c['emoji'] + ' ') if c['emoji'] else '')}{escape(c['name'])}</option>")
+    return f"<select name='category_id'>{''.join(options)}</select>"
+
+
+def form_category(db: Database, form) -> int | None:
+    value = str(form.get("category_id") or "")
+    if value.isdigit() and db.get_category(int(value)):
+        return int(value)
+    return None
+
+
 async def products(request: web.Request) -> web.Response:
     db = database(request)
     rows = []
+    names = {c["id"]: c["name"] for c in db.list_categories(only_active=False)}
     for p in db.list_products(only_active=False):
         sellable = db.sellable_quantity(p["id"])
         reserved = db.reserved_quantity(p["id"])
         state = badge("Đang bán", "good") if p["active"] else badge("Đang ẩn", "muted")
         rows.append(
             f"<tr><td class='num'>{p['id']}</td><td><a href='/admin/products/{p['id']}'>{escape(p['name'])}</a></td>"
-            f"<td class='num'>{money(p['price'])}</td>"
+            f"<td>{escape(names.get(p['category_id'], '—'))}</td><td class='num'>{money(p['price'])}</td>"
             f"<td class='num'>{badge(str(sellable), 'bad' if sellable == 0 else 'warn' if sellable <= LOW_STOCK else 'good')}</td>"
             f"<td class='num'>{reserved}</td><td class='num'>{db.delivered_count(p['id'])}</td><td>{state}</td>"
             f"<td><a class='btn small ghost' href='/admin/products/{p['id']}'>Sửa / nhập kho</a></td></tr>"
@@ -362,11 +379,12 @@ async def products(request: web.Request) -> web.Response:
     body = f"""<h1>Sản phẩm & kho</h1>
 <div class="card"><h2>Thêm sản phẩm</h2><form method="post" action="/admin/products">
 <div class="row"><div class="field" style="flex:2"><label>Tên sản phẩm</label><input name="name" required></div>
-<div class="field"><label>Giá (đồng)</label><input name="price" inputmode="numeric" placeholder="65000" required></div></div>
+<div class="field"><label>Giá (đồng)</label><input name="price" inputmode="numeric" placeholder="65000" required></div>
+<div class="field"><label>Nhóm</label>{category_select(db, None)}</div></div>
 <div class="field"><label>Mô tả</label><textarea name="description" style="min-height:70px"></textarea></div>
 <button>Thêm sản phẩm</button></form></div>
 <div class="card"><div class="table-wrap"><table class="wide">
-<tr><th class="num">ID</th><th>Tên</th><th class="num">Giá</th><th class="num">Còn bán</th><th class="num">Đang giữ</th>
+<tr><th class="num">ID</th><th>Tên</th><th>Nhóm</th><th class="num">Giá</th><th class="num">Còn bán</th><th class="num">Đang giữ</th>
 <th class="num">Đã bán</th><th>Trạng thái</th><th></th></tr>{table}</table></div>
 <p class="hint">"Đang giữ" là hàng đã được giữ cho đơn chờ thanh toán.</p></div>"""
     return page(request, "Sản phẩm", body, "products")
@@ -378,7 +396,10 @@ async def create_product(request: web.Request) -> web.Response:
         name = str(form.get("name", "")).strip()
         if not name:
             raise ValueError("Thiếu tên sản phẩm")
-        product_id = database(request).add_product(name, parse_price(str(form.get("price"))), str(form.get("description", "")).strip())
+        db = database(request)
+        product_id = db.add_product(
+            name, parse_price(str(form.get("price"))), str(form.get("description", "")).strip(), form_category(db, form)
+        )
     except ValueError as e:
         raise go("/admin/products", str(e), error=True)
     raise go(f"/admin/products/{product_id}", "Đã thêm sản phẩm. Giờ hãy nhập kho bên dưới.")
@@ -422,6 +443,7 @@ async def product_detail(request: web.Request) -> web.Response:
 <div class="card"><h2>Thông tin</h2><form method="post" action="/admin/products/{p['id']}">
 <div class="field"><label>Tên</label><input name="name" value="{escape(p['name'])}" required></div>
 <div class="field"><label>Giá (đồng)</label><input name="price" value="{p['price']}" inputmode="numeric" required></div>
+<div class="field"><label>Nhóm</label>{category_select(db, p['category_id'])}</div>
 <div class="field"><label>Mô tả</label><textarea name="description">{escape(p['description'])}</textarea></div>
 <button>Lưu</button></form>
 <div class="actions" style="margin-top:12px">
@@ -451,7 +473,10 @@ async def update_product(request: web.Request) -> web.Response:
         name = str(form.get("name", "")).strip()
         if not name:
             raise ValueError("Thiếu tên sản phẩm")
-        database(request).update_product(p["id"], name, parse_price(str(form.get("price"))), str(form.get("description", "")).strip())
+        db = database(request)
+        db.update_product(
+            p["id"], name, parse_price(str(form.get("price"))), str(form.get("description", "")).strip(), form_category(db, form)
+        )
     except ValueError as e:
         raise go(f"/admin/products/{p['id']}", str(e), error=True)
     raise go(f"/admin/products/{p['id']}", "Đã lưu.")
@@ -556,6 +581,83 @@ async def delete_stock(request: web.Request) -> web.Response:
     if product_id is None:
         raise go("/admin/products", "Không xoá được (hàng đã bán hoặc không còn).", error=True)
     raise go(f"/admin/products/{product_id}", "Đã xoá 1 hàng khỏi kho.")
+
+
+# ---------------------------------------------------------------- categories
+
+async def categories(request: web.Request) -> web.Response:
+    db = database(request)
+    rows = []
+    for c in db.list_categories(only_active=False):
+        f = f"cat-{c['id']}"
+        rows.append(
+            f"<tr><td><input form='{f}' name='sort' value='{c['sort']}' inputmode='numeric' style='width:60px'></td>"
+            f"<td><input form='{f}' name='emoji' value='{escape(c['emoji'])}' style='width:60px'></td>"
+            f"<td><input form='{f}' name='name' value='{escape(c['name'])}' required></td>"
+            f"<td><input form='{f}' name='icon_id' value='{escape(c['icon_id'])}' class='mono' placeholder='vd 5368324170671202286'></td>"
+            f"<td><label class='check'><input form='{f}' type='checkbox' name='active' {'checked' if c['active'] else ''}>Hiện</label></td>"
+            f"<td class='num'>{c['product_count']}</td>"
+            f"<td><div class='actions'><form id='{f}' method='post' action='/admin/categories/{c['id']}'>"
+            f"<button class='small'>Lưu</button></form>"
+            f"<form method='post' action='/admin/categories/{c['id']}/delete' "
+            f"onsubmit=\"return confirm('Xoá nhóm này? Sản phẩm trong nhóm sẽ chuyển sang Khác.')\">"
+            f"<button class='danger small'>Xoá</button></form></div></td></tr>"
+        )
+    table = "".join(rows) or "<tr><td colspan=7 class='muted'>Chưa có nhóm nào.</td></tr>"
+    body = f"""<h1>Danh mục (nhóm sản phẩm)</h1>
+<div class="card"><h2>Thêm nhóm</h2><form method="post" action="/admin/categories" class="row">
+<div class="field" style="flex:2"><label>Tên nhóm</label><input name="name" placeholder="ChatGPT" required></div>
+<div class="field" style="max-width:110px"><label>Emoji thường</label><input name="emoji" placeholder="🤖"></div>
+<div class="field" style="flex:2"><label>Mã logo (emoji động)</label><input name="icon_id" class="mono" placeholder="lấy bằng /emojiid trong bot"></div>
+<div class="field" style="max-width:90px"><label>Thứ tự</label><input name="sort" value="0" inputmode="numeric"></div>
+<div class="field" style="flex:0"><button>Thêm</button></div></form>
+<p class="hint">Khách bấm 🛍 Sản phẩm sẽ thấy các nhóm (2 nút mỗi hàng, sắp theo "Thứ tự" rồi theo tên). Nhóm chưa có sản phẩm sẽ không hiện.
+Gán sản phẩm vào nhóm ở trang <a href="/admin/products">Sản phẩm & kho</a>.</p></div>
+<div class="card"><div class="table-wrap"><table class="wide">
+<tr><th>Thứ tự</th><th>Emoji</th><th>Tên</th><th>Mã logo</th><th>Hiện</th><th class="num">Sản phẩm</th><th></th></tr>{table}</table></div></div>
+<div class="card"><h2>Cách lấy logo cho nút</h2>
+<p>1. Trong Telegram, thêm gói emoji có logo bạn muốn (bấm vào emoji động ở tin nhắn của người khác → Thêm).<br>
+2. Nhắn cho bot: <span class="mono">/emojiid</span> rồi chèn emoji động đó vào cùng tin nhắn → bot trả lại mã số.<br>
+3. Dán mã vào ô "Mã logo" của nhóm → Lưu.</p>
+<p class="hint">Logo trên nút chỉ hiện khi tài khoản đã tạo bot (chủ bot) có Telegram Premium. Nếu không, bot tự dùng ô "Emoji thường".</p></div>"""
+    return page(request, "Danh mục", body, "categories")
+
+
+def read_category_form(form) -> dict:
+    name = str(form.get("name", "")).strip()
+    if not name:
+        raise ValueError("Thiếu tên nhóm")
+    sort = str(form.get("sort", "0")).strip()
+    return {
+        "name": name,
+        "emoji": str(form.get("emoji", "")).strip()[:8],
+        "icon_id": re.sub(r"\D", "", str(form.get("icon_id", ""))),
+        "sort": int(sort) if sort.lstrip("-").isdigit() else 0,
+    }
+
+
+async def create_category(request: web.Request) -> web.Response:
+    try:
+        data = read_category_form(await request.post())
+    except ValueError as e:
+        raise go("/admin/categories", str(e), error=True)
+    database(request).add_category(**data)
+    raise go("/admin/categories", f"Đã thêm nhóm {data['name']}.")
+
+
+async def update_category(request: web.Request) -> web.Response:
+    form = await request.post()
+    try:
+        data = read_category_form(form)
+    except ValueError as e:
+        raise go("/admin/categories", str(e), error=True)
+    database(request).update_category(int(request.match_info["id"]), active=bool(form.get("active")), **data)
+    raise go("/admin/categories", f"Đã lưu nhóm {data['name']}.")
+
+
+async def delete_category(request: web.Request) -> web.Response:
+    database(request).delete_category(int(request.match_info["id"]))
+    raise go("/admin/categories", "Đã xoá nhóm.")
 
 
 # ---------------------------------------------------------------- orders
@@ -903,6 +1005,10 @@ def setup_admin(web_app: web.Application, tg_app) -> None:
     r.add_post("/admin/login", login)
     r.add_post("/admin/logout", logout)
     r.add_get("/admin/products", products)
+    r.add_get("/admin/categories", categories)
+    r.add_post("/admin/categories", create_category)
+    r.add_post("/admin/categories/{id:\\d+}", update_category)
+    r.add_post("/admin/categories/{id:\\d+}/delete", delete_category)
     r.add_post("/admin/products", create_product)
     r.add_get("/admin/products/{id:\\d+}", product_detail)
     r.add_post("/admin/products/{id:\\d+}", update_product)

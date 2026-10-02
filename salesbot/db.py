@@ -13,6 +13,14 @@ CREATE TABLE IF NOT EXISTS products (
     description TEXT NOT NULL DEFAULT '',
     active INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    emoji TEXT NOT NULL DEFAULT '',      -- plain emoji, used when custom emoji are unavailable
+    icon_id TEXT NOT NULL DEFAULT '',    -- Telegram custom emoji id shown on the button
+    sort INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS stock (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id INTEGER NOT NULL REFERENCES products(id),
@@ -68,6 +76,9 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(products)")}
+        if "category_id" not in columns:  # databases created before categories existed
+            self.conn.execute("ALTER TABLE products ADD COLUMN category_id INTEGER REFERENCES categories(id)")
         # Customers who ordered before the users table existed still get announcements.
         self.conn.execute(
             "INSERT OR IGNORE INTO users (id, username, joined_at)"
@@ -106,10 +117,10 @@ class Database:
         self.conn.execute("UPDATE users SET blocked = 1 WHERE id = ?", (user_id,))
 
     # ---------- products ----------
-    def add_product(self, name: str, price: int, description: str = "") -> int:
+    def add_product(self, name: str, price: int, description: str = "", category_id: int | None = None) -> int:
         cur = self.conn.execute(
-            "INSERT INTO products (name, price, description) VALUES (?, ?, ?)",
-            (name, price, description),
+            "INSERT INTO products (name, price, description, category_id) VALUES (?, ?, ?, ?)",
+            (name, price, description, category_id),
         )
         return cur.lastrowid
 
@@ -135,6 +146,45 @@ class Database:
         where = "WHERE active = 1" if only_active else ""
         return self.conn.execute(
             f"SELECT p.*, ({self._available_sql()}) AS stock FROM products p {where} ORDER BY id"
+        ).fetchall()
+
+    def products_in_category(self, category_id: int | None) -> list[sqlite3.Row]:
+        """Active products of a category; ``None`` means products without a category."""
+        cond = "p.category_id IS NULL" if category_id is None else "p.category_id = ?"
+        params = () if category_id is None else (category_id,)
+        return self.conn.execute(
+            f"SELECT p.*, ({self._available_sql()}) AS stock FROM products p"
+            f" WHERE p.active = 1 AND {cond} ORDER BY p.id",
+            params,
+        ).fetchall()
+
+    # ---------- categories ----------
+    def add_category(self, name: str, emoji: str = "", icon_id: str = "", sort: int = 0) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO categories (name, emoji, icon_id, sort) VALUES (?, ?, ?, ?)",
+            (name, emoji, icon_id, sort),
+        )
+        return cur.lastrowid
+
+    def update_category(self, category_id: int, name: str, emoji: str, icon_id: str, sort: int, active: bool) -> bool:
+        cur = self.conn.execute(
+            "UPDATE categories SET name = ?, emoji = ?, icon_id = ?, sort = ?, active = ? WHERE id = ?",
+            (name, emoji, icon_id, sort, int(active), category_id),
+        )
+        return cur.rowcount > 0
+
+    def delete_category(self, category_id: int) -> None:
+        self.conn.execute("UPDATE products SET category_id = NULL WHERE category_id = ?", (category_id,))
+        self.conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+
+    def get_category(self, category_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM categories WHERE id = ?", (category_id,)).fetchone()
+
+    def list_categories(self, only_active: bool = True) -> list[sqlite3.Row]:
+        where = "WHERE c.active = 1" if only_active else ""
+        return self.conn.execute(
+            "SELECT c.*, (SELECT COUNT(*) FROM products p WHERE p.category_id = c.id) AS product_count"
+            f" FROM categories c {where} ORDER BY c.sort, c.name"
         ).fetchall()
 
     @staticmethod
@@ -282,10 +332,12 @@ class Database:
         return expired
 
     # ---------- admin website ----------
-    def update_product(self, product_id: int, name: str, price: int, description: str) -> bool:
+    def update_product(
+        self, product_id: int, name: str, price: int, description: str, category_id: int | None = None
+    ) -> bool:
         cur = self.conn.execute(
-            "UPDATE products SET name = ?, price = ?, description = ? WHERE id = ?",
-            (name, price, description, product_id),
+            "UPDATE products SET name = ?, price = ?, description = ?, category_id = ? WHERE id = ?",
+            (name, price, description, category_id, product_id),
         )
         return cur.rowcount > 0
 

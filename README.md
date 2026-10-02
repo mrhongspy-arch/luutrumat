@@ -80,6 +80,13 @@ Bot ghi nhớ mọi người đã nhắn tin với nó, để gửi thông báo:
 - **Kênh Telegram (tuỳ chọn):** đặt `CHANNEL_ID=@kenhcuashop` và thêm bot làm admin kênh;
   thông báo có hàng sẽ được đăng lên kênh, nút Mua ngay mở bot đúng sản phẩm.
 
+## Nhóm sản phẩm có logo
+
+Trang quản trị → **Danh mục**: tạo nhóm (tên, emoji thường, mã logo, thứ tự) rồi gán sản phẩm vào nhóm.
+Khách bấm 🛍 Sản phẩm sẽ thấy các nhóm 2 nút mỗi hàng kèm số hàng còn. Logo trên nút là emoji động
+(`icon_custom_emoji_id`): lấy mã bằng lệnh `/emojiid` trong bot; chỉ hiện khi chủ bot có Telegram Premium,
+nếu không bot tự dùng emoji thường.
+
 ## Trang quản trị web
 
 Đặt `ADMIN_PASSWORD=...` (ít nhất 8 ký tự) trong `.env`, khởi động lại bot rồi mở
