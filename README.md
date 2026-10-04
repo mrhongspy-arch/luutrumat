@@ -96,6 +96,12 @@ nếu không bot tự dùng emoji thường.
   tự động số tiền thực nhận, hoặc admin bấm ✅. Khi đặt hàng, nếu đủ số dư sẽ có nút **💳 Trả bằng ví** để nhận hàng ngay.
   Trang quản trị → **Ví & nạp tiền**: duyệt yêu cầu nạp, cộng/trừ tiền thủ công, xem khách có số dư.
 
+## Bộ emoji logo
+
+Trang quản trị → **Bộ emoji**: tải nhiều ảnh logo cùng lúc (tên file = tên nhóm, vd `Netflix.png`). Bot thu ảnh về
+100×100, tạo bộ custom emoji đứng tên admin có Telegram Premium (`logo<ID>_by_<bot>`), lưu mã từng logo và tự gắn vào
+nhóm trùng tên. Có link `t.me/addemoji/...` để thêm bộ vào Telegram và nút gắn logo vào nhóm bất kỳ.
+
 ## Trang quản trị web
 
 Đặt `ADMIN_PASSWORD=...` (ít nhất 8 ký tự) trong `.env`, khởi động lại bot rồi mở

@@ -173,6 +173,7 @@ def page(request: web.Request, title: str, body: str, active: str = "") -> web.R
             ("home", "/admin", "Tổng quan"),
             ("products", "/admin/products", "Sản phẩm & kho"),
             ("categories", "/admin/categories", "Danh mục"),
+            ("emoji", "/admin/emoji", "Bộ emoji"),
             ("orders", "/admin/orders", "Đơn hàng"),
             ("wallet", "/admin/wallet", "Ví & nạp tiền"),
             ("posts", "/admin/posts", "Thông báo"),
@@ -665,6 +666,118 @@ async def delete_category(request: web.Request) -> web.Response:
     raise go("/admin/categories", "Đã xoá nhóm.")
 
 
+# ---------------------------------------------------------------- emoji pack
+
+def emoji_owner(request: web.Request) -> int:
+    admins = sorted(tg(request).bot_data["config"].admin_ids)
+    value = database(request).get_setting("emoji_owner", str(admins[0]) if admins else "")
+    return int(value) if value.isdigit() else 0
+
+
+async def emoji_page(request: web.Request) -> web.Response:
+    from .emojipack import pack_name
+
+    db = database(request)
+    owner = emoji_owner(request)
+    pack = pack_name(owner, tg(request).bot.username) if owner else ""
+    categories = db.list_categories(only_active=False)
+    used = {c["icon_id"]: c["name"] for c in categories if c["icon_id"]}
+    options = "".join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in categories)
+    rows = "".join(
+        f"<tr><td>{escape(l['name'])}</td><td class='mono'>{l['icon_id']}</td>"
+        f"<td>{escape(used.get(l['icon_id'], '—'))}</td>"
+        f"<td><form class='row' method='post' action='/admin/emoji/assign' style='gap:6px'>"
+        f"<input type='hidden' name='icon_id' value='{l['icon_id']}'>"
+        f"<select name='category_id' style='min-width:140px'>{options}</select>"
+        f"<button class='small ghost'>Gắn vào nhóm</button></form></td></tr>"
+        for l in db.list_logos()
+    ) or "<tr><td colspan=4 class='muted'>Chưa có logo nào.</td></tr>"
+    pack_link = f'<a href="https://t.me/addemoji/{pack}" target="_blank">t.me/addemoji/{pack}</a>' if pack else "—"
+    body = f"""<h1>Bộ emoji logo</h1>
+<div class="grid g2">
+<div class="card"><h2>Tải logo lên</h2>
+<form method="post" action="/admin/emoji" enctype="multipart/form-data">
+<div class="field"><label>Ảnh logo (chọn được nhiều file: .png, .jpg, .webp)</label>
+<input type="file" name="files" accept=".png,.jpg,.jpeg,.webp" multiple required>
+<p class="hint">Đặt <b>tên file = tên nhóm</b>, ví dụ <span class="mono">Netflix.png</span>, <span class="mono">ChatGPT.png</span>.
+Ảnh được tự thu về 100×100, nên dùng ảnh vuông, nền trong suốt.</p></div>
+<label class="check"><input type="checkbox" name="auto" checked>Tự gắn logo vào nhóm trùng tên</label>
+<button onclick="this.textContent='Đang tạo… (có thể mất 1–2 phút)'">Tạo emoji</button></form></div>
+<div class="card"><h2>Thông tin bộ emoji</h2>
+<p>Thêm bộ vào Telegram: {pack_link}</p>
+<form method="post" action="/admin/emoji/owner" class="row">
+<div class="field"><label>ID Telegram của chủ bộ emoji (tài khoản có Premium, đã tạo bot)</label>
+<input name="owner" value="{owner or ''}" inputmode="numeric"></div>
+<div class="field" style="flex:0"><button class="ghost">Lưu</button></div></form>
+<p class="hint">Bộ emoji đứng tên tài khoản này; bạn có thể chỉnh sửa thêm qua @Stickers trên Telegram.
+Logo thương hiệu thuộc về các công ty tương ứng, chỉ dùng để nhận diện sản phẩm.</p></div></div>
+<div class="card"><h2>Logo đã tạo</h2><div class="table-wrap"><table class="wide">
+<tr><th>Tên</th><th>Mã logo</th><th>Đang dùng cho nhóm</th><th></th></tr>{rows}</table></div></div>"""
+    return page(request, "Bộ emoji", body, "emoji")
+
+
+async def create_emoji(request: web.Request) -> web.Response:
+    from .emojipack import add_logos, logo_name, match_key, pack_name, to_emoji_png
+
+    db = database(request)
+    owner = emoji_owner(request)
+    if not owner:
+        raise go("/admin/emoji", "Chưa có ID chủ bộ emoji.", error=True)
+    form = await request.post()
+    logos, problems = [], []
+    for upload in form.getall("files", []):
+        if not getattr(upload, "filename", ""):
+            continue
+        name = logo_name(upload.filename)
+        try:
+            logos.append((name, to_emoji_png(upload.file.read()), "⭐"))
+        except ValueError:
+            problems.append(name)
+    if not logos:
+        raise go("/admin/emoji", "Không có ảnh hợp lệ nào.", error=True)
+    bot = tg(request).bot
+    try:
+        created = await add_logos(bot, owner, pack_name(owner, bot.username), "Logo shop", logos)
+    except ValueError as e:
+        raise go("/admin/emoji", str(e), error=True)
+    except TelegramError as e:
+        raise go("/admin/emoji", f"Telegram báo lỗi: {e}. Kiểm tra ID chủ bộ emoji và tài khoản đó đã nhắn /start cho bot.", error=True)
+    assigned = []
+    categories = {match_key(c["name"]): c for c in db.list_categories(only_active=False)}
+    for name, icon_id in created:
+        db.add_logo(name, icon_id)
+        category = categories.get(match_key(name))
+        if form.get("auto") and category:
+            db.set_category_icon(category["id"], icon_id)
+            assigned.append(category["name"])
+    msg = f"Đã tạo {len(created)} logo."
+    if assigned:
+        msg += f" Đã gắn vào nhóm: {', '.join(assigned)}."
+    if problems:
+        msg += f" Bỏ qua ảnh lỗi: {', '.join(problems)}."
+    raise go("/admin/emoji", msg)
+
+
+async def assign_emoji(request: web.Request) -> web.Response:
+    db = database(request)
+    form = await request.post()
+    category_id = str(form.get("category_id", ""))
+    icon_id = re.sub(r"\D", "", str(form.get("icon_id", "")))
+    category = db.get_category(int(category_id)) if category_id.isdigit() else None
+    if category is None or not icon_id:
+        raise go("/admin/emoji", "Chọn nhóm để gắn logo.", error=True)
+    db.set_category_icon(category["id"], icon_id)
+    raise go("/admin/emoji", f"Đã gắn logo vào nhóm {category['name']}.")
+
+
+async def set_emoji_owner(request: web.Request) -> web.Response:
+    value = str((await request.post()).get("owner", "")).strip()
+    if not value.isdigit():
+        raise go("/admin/emoji", "ID phải là số.", error=True)
+    database(request).set_setting("emoji_owner", value)
+    raise go("/admin/emoji", "Đã lưu chủ bộ emoji.")
+
+
 # ---------------------------------------------------------------- wallet
 
 DEPOSIT_STATUS = {"pending": ("Chờ chuyển khoản", "warn"), "paid": ("Đã cộng ví", "good"), "cancelled": ("Đã huỷ", "muted")}
@@ -1102,6 +1215,10 @@ def setup_admin(web_app: web.Application, tg_app) -> None:
     r.add_get("/admin/products", products)
     r.add_get("/admin/categories", categories)
     r.add_get("/admin/wallet", wallet_page)
+    r.add_get("/admin/emoji", emoji_page)
+    r.add_post("/admin/emoji", create_emoji)
+    r.add_post("/admin/emoji/assign", assign_emoji)
+    r.add_post("/admin/emoji/owner", set_emoji_owner)
     r.add_post("/admin/wallet/adjust", adjust_wallet)
     r.add_post("/admin/deposits/{id:\\d+}/confirm", confirm_deposit)
     r.add_post("/admin/deposits/{id:\\d+}/cancel", cancel_deposit)

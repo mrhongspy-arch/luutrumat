@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS wallet_tx (
     ref TEXT NOT NULL DEFAULT '',            -- deposit/order code or admin note
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS emoji_logos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    icon_id TEXT NOT NULL UNIQUE,            -- custom emoji id inside the shop's emoji pack
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_wallet_tx_user ON wallet_tx(user_id);
 CREATE INDEX IF NOT EXISTS idx_stock_available ON stock(product_id, order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
@@ -187,6 +193,18 @@ class Database:
             f" WHERE p.active = 1 AND {cond} ORDER BY p.id",
             params,
         ).fetchall()
+
+    # ---------- emoji logos ----------
+    def add_logo(self, name: str, icon_id: str) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO emoji_logos (name, icon_id, created_at) VALUES (?, ?, ?)", (name, icon_id, _now())
+        )
+
+    def list_logos(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM emoji_logos ORDER BY name COLLATE NOCASE").fetchall()
+
+    def set_category_icon(self, category_id: int, icon_id: str) -> None:
+        self.conn.execute("UPDATE categories SET icon_id = ? WHERE id = ?", (icon_id, category_id))
 
     # ---------- categories ----------
     def add_category(self, name: str, emoji: str = "", icon_id: str = "", sort: int = 0) -> int:
